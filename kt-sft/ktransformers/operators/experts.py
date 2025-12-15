@@ -1645,11 +1645,12 @@ class KSFTRouteExpertsCPU(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, output_grad):
-        # Same backward logic as KSFTExpertsCPU
+        # Not Same backward logic as KSFTExpertsCPU
         input_tensor, expert_ids, weights = ctx.saved_tensors
 
         output_grad = output_grad.contiguous().cpu()
         input_grad = torch.empty_like(input_tensor).contiguous()
+        grad_weights = torch.zeros_like(weights, dtype=torch.float32).contiguous()
 
         # Clear gradient buffers before backward pass (avoid accumulating stale gradients)
         if ctx.layer_idx in KSFTRouteExpertsCPU._instance_map:
@@ -1672,6 +1673,7 @@ class KSFTRouteExpertsCPU(torch.autograd.Function):
                 input_tensor.data_ptr(),
                 output_grad.data_ptr(),
                 input_grad.data_ptr(),
+                grad_weights.data_ptr(),
             )
         )
         ctx.cpu_infer.sync()
@@ -1719,7 +1721,7 @@ class KSFTRouteExpertsCPU(torch.autograd.Function):
                         gate_B_grad_mean = param_lists[1][0].grad.abs().mean().item() if param_lists[1][0].grad is not None else 0.0
                         # print(f"[Layer {ctx.layer_idx} Backward] lora_B: mean={gate_B_mean:.6f}, grad_mean={gate_B_grad_mean:.6f}")
 
-        return input_grad.to(device=ctx.out_device), None, None, None, None, None, None
+        return input_grad.to(device=ctx.out_device), None, grad_weights.to(device=ctx.out_device), None, None, None, None
 
     def unload(self):
         return

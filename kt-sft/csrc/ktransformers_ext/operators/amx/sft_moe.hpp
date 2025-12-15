@@ -29,6 +29,8 @@
 
 #include "la/amx.hpp"
 
+#include "moe.hpp"
+
 #ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>

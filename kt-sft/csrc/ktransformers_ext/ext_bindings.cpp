@@ -994,6 +994,7 @@ class SFT_ROUTE_MOEBindings {
             const void* input;
             const void* output_grad;
             void* input_grad;
+            void* grad_weights;
         };
 
         static void inner(void *args) {
@@ -1006,14 +1007,15 @@ class SFT_ROUTE_MOEBindings {
                 args_->weights,
                 args_->input,
                 args_->output_grad,
-                args_->input_grad);
+                args_->input_grad, 
+                args_->grad_weights);
         }
 
         static std::pair<intptr_t, intptr_t> cpuinfer_interface(
             SFT_ROUTE_MOE<T> &moe, int qlen, int k,
             intptr_t expert_ids, intptr_t weights,
             intptr_t input,
-            intptr_t output_grad, intptr_t input_grad) {
+            intptr_t output_grad, intptr_t input_grad, intptr_t grad_weights) {
 
             Args* args = new Args{
                 nullptr, &moe, qlen, k,
@@ -1021,7 +1023,8 @@ class SFT_ROUTE_MOEBindings {
                 (const float*)weights,
                 (const void*)input,
                 (const void*)output_grad,
-                (void*)input_grad
+                (void*)input_grad,
+                (void*)grad_weights
             };
             return std::make_pair(
                 (intptr_t)&inner,

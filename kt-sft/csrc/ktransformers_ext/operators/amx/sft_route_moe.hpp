@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <fstream>
@@ -27,6 +28,8 @@
 #include "llamafile/sgemm.h"
 
 #include "la/amx.hpp"
+
+#include "moe.hpp"
 
 #ifdef USE_NUMA
 #include <numa.h>
@@ -183,12 +186,11 @@ private:
   // Track all allocated buffers for cleanup in destructor
   std::vector<void*> allocated_buffers_;
 
+    // forward buffer requests
+  std::vector<std::pair<void**, uint64_t>> m_mem_requests_fwd;
+  std::vector<std::pair<void**, uint64_t>> m_mem_requests_bak;
+
   // AMX buffers for matrix multiplication
-  std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
-  std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
-  std::vector<std::shared_ptr<typename T::BufferC>> up_bc_;
-  std::vector<std::shared_ptr<typename T::BufferA>> down_ba_;
-  std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
 
 #ifdef USE_NUMA
   std::vector<std::vector<std::shared_ptr<typename T::BufferB>>> gate_bb_numa_;
@@ -201,12 +203,7 @@ private:
 #endif
 
   // Backward pass buffers
-  std::vector<std::shared_ptr<typename T::BufferA>> gate_t_ba_;
-  std::vector<std::shared_ptr<typename T::BufferC>> gate_t_bc_;
-  std::vector<std::shared_ptr<typename T::BufferA>> up_t_ba_;
-  std::vector<std::shared_ptr<typename T::BufferC>> up_t_bc_;
-  std::vector<std::shared_ptr<typename T::BufferA>> down_t_ba_;
-  std::vector<std::shared_ptr<typename T::BufferC>> down_t_bc_;
+
 
 #ifdef USE_NUMA
   std::vector<std::vector<std::shared_ptr<typename T::BufferB>>> gate_t_bb_numa_;
@@ -222,40 +219,73 @@ private:
   // NOTE: lora_rank is padded to 32 for AMX alignment (actual rank may be smaller)
   int padded_lora_rank_;  // Padded lora_rank to meet AMX 32-alignment requirement
 
-  // Gate projection LoRA buffers
-  std::vector<std::shared_ptr<typename T::BufferA>> lora_gate_input_ba_;       // [num_tokens, hidden_size]
-  std::vector<std::shared_ptr<typename T::BufferC>> lora_gate_inter_bc_;       // [num_tokens, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferA>> lora_gate_grad_ba_;        // [num_tokens, intermediate_size]
-  std::vector<std::shared_ptr<typename T::BufferC>> lora_gate_temp_grad_bc_;   // [num_tokens, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_A_bb_;           // [padded_rank, hidden_size]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_B_bb_;           // [intermediate_size, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_B_t_bb_;         // [padded_rank, intermediate_size] - transposed for grad_A computation
-  std::vector<std::shared_ptr<typename T::BufferC>> grad_gate_lora_A_bc_;      // [padded_rank, hidden_size]
-  std::vector<std::shared_ptr<typename T::BufferC>> grad_gate_lora_B_bc_;      // [intermediate_size, padded_rank]
+ 
 
-  // Up projection LoRA buffers
-  std::vector<std::shared_ptr<typename T::BufferC>> lora_up_inter_bc_;         // [num_tokens, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferA>> lora_up_grad_ba_;          // [num_tokens, intermediate_size]
-  std::vector<std::shared_ptr<typename T::BufferC>> lora_up_temp_grad_bc_;     // [num_tokens, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_up_A_bb_;             // [padded_rank, hidden_size]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_up_B_bb_;             // [intermediate_size, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_up_B_t_bb_;           // [padded_rank, intermediate_size] - transposed for grad_A computation
-  std::vector<std::shared_ptr<typename T::BufferC>> grad_up_lora_A_bc_;        // [padded_rank, hidden_size]
-  std::vector<std::shared_ptr<typename T::BufferC>> grad_up_lora_B_bc_;        // [intermediate_size, padded_rank]
+  std::vector<void *> gate_up_ba_ptr;
+  std::vector<void *> gate_bc_ptr;
+  std::vector<void *> up_bc_ptr;
+  std::vector<void *> down_ba_ptr;
+  std::vector<void *> down_bc_ptr;
+  std::vector<void *> gate_t_ba_ptr;
+  std::vector<void *> gate_t_bc_ptr;
+  std::vector<void *> up_t_ba_ptr;
+  std::vector<void *> up_t_bc_ptr;
+  std::vector<void *> down_t_ba_ptr;
+  std::vector<void *> down_t_bc_ptr;
 
-  // Down projection LoRA buffers
-  std::vector<std::shared_ptr<typename T::BufferA>> lora_down_inter_ba_;       // [num_tokens, intermediate_size] (intermediate = silu(gate) * up)
-  std::vector<std::shared_ptr<typename T::BufferC>> lora_down_lora_inter_bc_;  // [num_tokens, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferA>> lora_down_grad_ba_;        // [num_tokens, hidden_size]
-  std::vector<std::shared_ptr<typename T::BufferC>> lora_down_temp_grad_bc_;   // [num_tokens, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_down_A_bb_;           // [padded_rank, intermediate_size]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_down_B_bb_;           // [hidden_size, padded_rank]
-  std::vector<std::shared_ptr<typename T::BufferB>> lora_down_B_t_bb_;         // [padded_rank, hidden_size] - transposed for grad_A computation
-  std::vector<std::shared_ptr<typename T::BufferC>> grad_down_lora_A_bc_;      // [padded_rank, intermediate_size]
-  std::vector<std::shared_ptr<typename T::BufferC>> grad_down_lora_B_bc_;      // [hidden_size, padded_rank]
+  // LoRA buffer pointers (allocated via shared_mem_buffer like gate_up_ba_ptr etc.)
+  std::vector<void *> lora_gate_input_ba_ptr;
+  std::vector<void *> lora_gate_inter_bc_ptr;
+  std::vector<void *> lora_gate_grad_ba_ptr;
+  std::vector<void *> lora_gate_temp_grad_bc_ptr;
+  std::vector<void *> lora_gate_A_bb_ptr;
+  std::vector<void *> lora_gate_B_bb_ptr;
+  std::vector<void *> lora_gate_B_t_bb_ptr;
+  std::vector<void *> grad_gate_lora_A_bc_ptr;
+  std::vector<void *> grad_gate_lora_B_bc_ptr;
+
+  std::vector<void *> lora_up_inter_bc_ptr;
+  std::vector<void *> lora_up_grad_ba_ptr;
+  std::vector<void *> lora_up_temp_grad_bc_ptr;
+  std::vector<void *> lora_up_A_bb_ptr;
+  std::vector<void *> lora_up_B_bb_ptr;
+  std::vector<void *> lora_up_B_t_bb_ptr;
+  std::vector<void *> grad_up_lora_A_bc_ptr;
+  std::vector<void *> grad_up_lora_B_bc_ptr;
+
+  std::vector<void *> lora_down_inter_ba_ptr;
+  std::vector<void *> lora_down_lora_inter_bc_ptr;
+  std::vector<void *> lora_down_grad_ba_ptr;
+  std::vector<void *> lora_down_temp_grad_bc_ptr;
+  std::vector<void *> lora_down_A_bb_ptr;
+  std::vector<void *> lora_down_B_bb_ptr;
+  std::vector<void *> lora_down_B_t_bb_ptr;
+  std::vector<void *> grad_down_lora_A_bc_ptr;
+  std::vector<void *> grad_down_lora_B_bc_ptr;
+
 
 public:
-  SFT_ROUTE_MOE(SFT_ROUTE_MOEConfig config) {
+  SFT_ROUTE_MOE(SFT_ROUTE_MOEConfig config)
+  : gate_up_ba_ptr(config.expert_num, 0), gate_bc_ptr(config.expert_num, 0),
+    up_bc_ptr(config.expert_num, 0), down_ba_ptr(config.expert_num, 0),
+    down_bc_ptr(config.expert_num, 0), gate_t_ba_ptr(config.expert_num, 0), gate_t_bc_ptr(config.expert_num, 0),
+    up_t_ba_ptr(config.expert_num, 0), up_t_bc_ptr(config.expert_num, 0),
+    down_t_ba_ptr(config.expert_num, 0), down_t_bc_ptr(config.expert_num, 0),
+    // LoRA buffer pointers initialization
+    lora_gate_input_ba_ptr(config.expert_num, 0), lora_gate_inter_bc_ptr(config.expert_num, 0),
+    lora_gate_grad_ba_ptr(config.expert_num, 0), lora_gate_temp_grad_bc_ptr(config.expert_num, 0),
+    lora_gate_A_bb_ptr(config.expert_num, 0), lora_gate_B_bb_ptr(config.expert_num, 0),
+    lora_gate_B_t_bb_ptr(config.expert_num, 0), grad_gate_lora_A_bc_ptr(config.expert_num, 0),
+    grad_gate_lora_B_bc_ptr(config.expert_num, 0),
+    lora_up_inter_bc_ptr(config.expert_num, 0), lora_up_grad_ba_ptr(config.expert_num, 0),
+    lora_up_temp_grad_bc_ptr(config.expert_num, 0), lora_up_A_bb_ptr(config.expert_num, 0),
+    lora_up_B_bb_ptr(config.expert_num, 0), lora_up_B_t_bb_ptr(config.expert_num, 0),
+    grad_up_lora_A_bc_ptr(config.expert_num, 0), grad_up_lora_B_bc_ptr(config.expert_num, 0),
+    lora_down_inter_ba_ptr(config.expert_num, 0), lora_down_lora_inter_bc_ptr(config.expert_num, 0),
+    lora_down_grad_ba_ptr(config.expert_num, 0), lora_down_temp_grad_bc_ptr(config.expert_num, 0),
+    lora_down_A_bb_ptr(config.expert_num, 0), lora_down_B_bb_ptr(config.expert_num, 0),
+    lora_down_B_t_bb_ptr(config.expert_num, 0), grad_down_lora_A_bc_ptr(config.expert_num, 0),
+    grad_down_lora_B_bc_ptr(config.expert_num, 0) {
     config_ = config;
     gate_proj_base_ = config_.gate_proj_base;
     up_proj_base_ = config_.up_proj_base;
@@ -276,59 +306,75 @@ public:
     // multiple SFT_ROUTE_MOE objects (different layers) exist simultaneously
     // and cannot share the same memory space.
 
+
     // Helper lambda to allocate and track buffers
     auto alloc_buffer = [this](size_t size, const char* name) -> void* {
       // Align size to 64 bytes
+      auto format_size = [](size_t bytes) -> std::string {
+        const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+        int unit_idx = 0;
+        double size = static_cast<double>(bytes);
+        while (size >= 1024.0 && unit_idx < 4) {
+          size /= 1024.0;
+          unit_idx++;
+        }
+        char buf[64];
+        if (unit_idx == 0) {
+          snprintf(buf, sizeof(buf), "%zu %s", bytes, units[unit_idx]);
+        } else {
+          snprintf(buf, sizeof(buf), "%.2f %s", size, units[unit_idx]);
+        }
+        return std::string(buf);
+      };
       size_t aligned_size = (size + 63) & ~63ULL;
       void* ptr = std::aligned_alloc(64, aligned_size);
       if (!ptr) {
         throw std::bad_alloc();
       }
+      printf("[SFT_ROUTE_MOE] allocate buffer %s of size %s\n", name, format_size(aligned_size).c_str());
       allocated_buffers_.push_back(ptr);
       return ptr;
     };
 
-    // Local buffers
-    m_local_input_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size,
-        "m_local_input_");
-    m_local_gate_output_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size,
-        "m_local_gate_output_");
-    m_local_up_output_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size,
-        "m_local_up_output_");
-    m_local_down_output_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size,
-        "m_local_down_output_");
+    // Local buffers - forward pass
+    m_mem_requests_fwd.push_back({(void **)&m_local_input_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size});
+    m_mem_requests_fwd.push_back({(void **)&m_local_gate_output_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size});
+    m_mem_requests_fwd.push_back({(void **)&m_local_up_output_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size});
+    m_mem_requests_fwd.push_back({(void **)&m_local_down_output_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size});
 
-    // Gradient buffers
-    m_local_down_output_grad_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size,
-        "m_local_down_output_grad_");
-    m_local_down_input_grad_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size,
-        "m_local_down_input_grad_");
-    m_local_gate_output_grad_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size,
-        "m_local_gate_output_grad_");
-    m_local_up_output_grad_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size,
-        "m_local_up_output_grad_");
-    m_local_gate_input_grad_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size,
-        "m_local_gate_input_grad_");
-    m_local_up_input_grad_ = (ggml_bf16_t*)alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size,
-        "m_local_up_input_grad_");
+    // Local buffers - backward pass (reuse some forward buffers)
+    m_mem_requests_bak.push_back({(void **)&m_local_input_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_gate_output_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_up_output_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_down_output_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size});
 
-    // Token indices
-    m_local_token_indices_ = (int*)alloc_buffer(
-        sizeof(int) * config_.routed_expert_num * config_.max_len,
-        "m_local_token_indices_");
-    m_local_expert_positions_ = (int*)alloc_buffer(
-        sizeof(int) * config_.routed_expert_num * config_.max_len,
-        "m_local_expert_positions_");
+    // Gradient buffers - backward pass only
+    m_mem_requests_bak.push_back({(void **)&m_local_down_output_grad_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_down_input_grad_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_gate_output_grad_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_up_output_grad_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.intermediate_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_gate_input_grad_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size});
+    m_mem_requests_bak.push_back({(void **)&m_local_up_input_grad_,
+        sizeof(ggml_bf16_t) * config_.routed_expert_num * config_.max_len * config_.hidden_size});
+
+    // Token indices - backward pass only
+    m_mem_requests_bak.push_back({(void **)&m_local_token_indices_,
+        sizeof(int) * config_.routed_expert_num * config_.max_len});
+    m_mem_requests_bak.push_back({(void **)&m_local_expert_positions_,
+        sizeof(int) * config_.routed_expert_num * config_.max_len});
 
     // Merged weights
     gate_proj_merged_ = alloc_buffer(
@@ -353,171 +399,132 @@ public:
         "down_proj_t_");
 
     // AMX buffers - allocate independently for each expert
-    std::vector<void *> gate_up_ba_ptr(config_.expert_num);
-    std::vector<void *> gate_bc_ptr(config_.expert_num);
-    std::vector<void *> up_bc_ptr(config_.expert_num);
-    std::vector<void *> down_ba_ptr(config_.expert_num);
-    std::vector<void *> down_bc_ptr(config_.expert_num);
-    std::vector<void *> gate_t_ba_ptr(config_.expert_num);
-    std::vector<void *> gate_t_bc_ptr(config_.expert_num);
-    std::vector<void *> up_t_ba_ptr(config_.expert_num);
-    std::vector<void *> up_t_bc_ptr(config_.expert_num);
-    std::vector<void *> down_t_ba_ptr(config_.expert_num);
-    std::vector<void *> down_t_bc_ptr(config_.expert_num);
-
-    // LoRA gradient buffers - allocate only if lora_rank > 0
-    std::vector<void *> lora_gate_input_ba_ptr(config_.expert_num);
-    std::vector<void *> lora_gate_inter_bc_ptr(config_.expert_num);
-    std::vector<void *> lora_gate_grad_ba_ptr(config_.expert_num);
-    std::vector<void *> lora_gate_temp_grad_bc_ptr(config_.expert_num);
-    std::vector<void *> lora_gate_A_bb_ptr(config_.expert_num);
-    std::vector<void *> lora_gate_B_bb_ptr(config_.expert_num);
-    std::vector<void *> lora_gate_B_t_bb_ptr(config_.expert_num);  // transposed for grad_A computation
-    std::vector<void *> grad_gate_lora_A_bc_ptr(config_.expert_num);
-    std::vector<void *> grad_gate_lora_B_bc_ptr(config_.expert_num);
-
-    std::vector<void *> lora_up_inter_bc_ptr(config_.expert_num);
-    std::vector<void *> lora_up_grad_ba_ptr(config_.expert_num);
-    std::vector<void *> lora_up_temp_grad_bc_ptr(config_.expert_num);
-    std::vector<void *> lora_up_A_bb_ptr(config_.expert_num);
-    std::vector<void *> lora_up_B_bb_ptr(config_.expert_num);
-    std::vector<void *> lora_up_B_t_bb_ptr(config_.expert_num);  // transposed for grad_A computation
-    std::vector<void *> grad_up_lora_A_bc_ptr(config_.expert_num);
-    std::vector<void *> grad_up_lora_B_bc_ptr(config_.expert_num);
-
-    std::vector<void *> lora_down_inter_ba_ptr(config_.expert_num);
-    std::vector<void *> lora_down_lora_inter_bc_ptr(config_.expert_num);
-    std::vector<void *> lora_down_grad_ba_ptr(config_.expert_num);
-    std::vector<void *> lora_down_temp_grad_bc_ptr(config_.expert_num);
-    std::vector<void *> lora_down_A_bb_ptr(config_.expert_num);
-    std::vector<void *> lora_down_B_bb_ptr(config_.expert_num);
-    std::vector<void *> lora_down_B_t_bb_ptr(config_.expert_num);  // transposed for grad_A computation
-    std::vector<void *> grad_down_lora_A_bc_ptr(config_.expert_num);
-    std::vector<void *> grad_down_lora_B_bc_ptr(config_.expert_num);
 
     for (int i = 0; i < config_.expert_num; i++) {
       // Forward pass buffers
-      gate_up_ba_ptr[i] = alloc_buffer(
-          T::BufferA::required_size(config_.max_len, config_.hidden_size),
-          "gate_up_ba");
-      gate_bc_ptr[i] = alloc_buffer(
-          T::BufferC::required_size(config_.max_len, config_.intermediate_size),
-          "gate_bc");
-      up_bc_ptr[i] = alloc_buffer(
-          T::BufferC::required_size(config_.max_len, config_.intermediate_size),
-          "up_bc");
-      down_ba_ptr[i] = alloc_buffer(
-          T::BufferA::required_size(config_.max_len, config_.intermediate_size),
-          "down_ba");
-      down_bc_ptr[i] = alloc_buffer(
-          T::BufferC::required_size(config_.max_len, config_.hidden_size),
-          "down_bc");
+      // gate_up_ba_ptr[i] = alloc_buffer(
+      //     T::BufferA::required_size(config_.max_len, config_.hidden_size),
+      //     "gate_up_ba");
+      // gate_bc_ptr[i] = alloc_buffer(
+      //     T::BufferC::required_size(config_.max_len, config_.intermediate_size),
+      //     "gate_bc");
+      // up_bc_ptr[i] = alloc_buffer(
+      //     T::BufferC::required_size(config_.max_len, config_.intermediate_size),
+      //     "up_bc");
+      // down_ba_ptr[i] = alloc_buffer(
+      //     T::BufferA::required_size(config_.max_len, config_.intermediate_size),
+      //     "down_ba");
+      // down_bc_ptr[i] = alloc_buffer(
+      //     T::BufferC::required_size(config_.max_len, config_.hidden_size),
+      //     "down_bc");
+
+      m_mem_requests_fwd.push_back({(void **)&gate_up_ba_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.hidden_size)});
+      m_mem_requests_fwd.push_back({(void **)&gate_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.intermediate_size)});
+      m_mem_requests_fwd.push_back({(void **)&up_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.intermediate_size)});
+      m_mem_requests_fwd.push_back({(void **)&down_ba_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.intermediate_size)});
+      m_mem_requests_fwd.push_back({(void **)&down_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.hidden_size)});
+
+      m_mem_requests_bak.push_back({(void **)&gate_up_ba_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.hidden_size)});
+      m_mem_requests_bak.push_back({(void **)&gate_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.intermediate_size)});
+      m_mem_requests_bak.push_back({(void **)&up_bc_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.intermediate_size)});
+
 
       // Backward pass buffers
-      gate_t_ba_ptr[i] = alloc_buffer(
-          T::BufferA::required_size(config_.max_len, config_.intermediate_size),
-          "gate_t_ba");
-      gate_t_bc_ptr[i] = alloc_buffer(
-          T::BufferC::required_size(config_.max_len, config_.hidden_size),
-          "gate_t_bc");
-      up_t_ba_ptr[i] = alloc_buffer(
-          T::BufferA::required_size(config_.max_len, config_.intermediate_size),
-          "up_t_ba");
-      up_t_bc_ptr[i] = alloc_buffer(
-          T::BufferC::required_size(config_.max_len, config_.hidden_size),
-          "up_t_bc");
-      down_t_ba_ptr[i] = alloc_buffer(
-          T::BufferA::required_size(config_.max_len, config_.hidden_size),
-          "down_t_ba");
-      down_t_bc_ptr[i] = alloc_buffer(
-          T::BufferC::required_size(config_.max_len, config_.intermediate_size),
-          "down_t_bc");
+      m_mem_requests_bak.push_back({(void **)&down_ba_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.intermediate_size)});
+      m_mem_requests_bak.push_back({(void **)&down_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.hidden_size)});
+
+
+      m_mem_requests_bak.push_back({(void **)&gate_t_ba_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.intermediate_size)});
+
+      m_mem_requests_bak.push_back({(void **)&gate_t_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.hidden_size)});
+
+      m_mem_requests_bak.push_back({(void **)&up_t_ba_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.intermediate_size)
+      });
+
+      m_mem_requests_bak.push_back({(void **)&up_t_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.hidden_size)
+      });
+
+      m_mem_requests_bak.push_back({(void **)&down_t_ba_ptr[i],
+          T::BufferA::required_size(config_.max_len, config_.hidden_size)
+      });
+      
+      m_mem_requests_bak.push_back({(void **)&down_t_bc_ptr[i],
+          T::BufferC::required_size(config_.max_len, config_.intermediate_size)
+      });
 
       // LoRA gradient computation buffers (only if lora_rank > 0)
       if (config_.lora_rank > 0) {
         // Gate projection LoRA buffers
-        lora_gate_input_ba_ptr[i] = alloc_buffer(
-            T::BufferA::required_size(config_.max_len, config_.hidden_size),
-            "lora_gate_input_ba");
-        lora_gate_inter_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.max_len, padded_lora_rank_),
-            "lora_gate_inter_bc");
-        lora_gate_grad_ba_ptr[i] = alloc_buffer(
-            T::BufferA::required_size(config_.max_len, config_.intermediate_size),
-            "lora_gate_grad_ba");
-        lora_gate_temp_grad_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.max_len, padded_lora_rank_),
-            "lora_gate_temp_grad_bc");
-        lora_gate_A_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(padded_lora_rank_, config_.hidden_size),
-            "lora_gate_A_bb");
-        lora_gate_B_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(config_.intermediate_size, padded_lora_rank_),
-            "lora_gate_B_bb");
-        lora_gate_B_t_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(padded_lora_rank_, config_.intermediate_size),
-            "lora_gate_B_t_bb");  // transposed: [padded_rank, intermediate]
-        grad_gate_lora_A_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(padded_lora_rank_, config_.hidden_size),
-            "grad_gate_lora_A_bc");
-        grad_gate_lora_B_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.intermediate_size, padded_lora_rank_),
-            "grad_gate_lora_B_bc");
+        m_mem_requests_bak.push_back({(void **)&lora_gate_input_ba_ptr[i],
+            T::BufferA::required_size(config_.max_len, config_.hidden_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_gate_inter_bc_ptr[i],
+            T::BufferC::required_size(config_.max_len, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_gate_grad_ba_ptr[i],
+            T::BufferA::required_size(config_.max_len, config_.intermediate_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_gate_temp_grad_bc_ptr[i],
+            T::BufferC::required_size(config_.max_len, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_gate_A_bb_ptr[i],
+            T::BufferB::required_size(padded_lora_rank_, config_.hidden_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_gate_B_bb_ptr[i],
+            T::BufferB::required_size(config_.intermediate_size, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_gate_B_t_bb_ptr[i],
+            T::BufferB::required_size(padded_lora_rank_, config_.intermediate_size)});
+        m_mem_requests_bak.push_back({(void **)&grad_gate_lora_A_bc_ptr[i],
+            T::BufferC::required_size(padded_lora_rank_, config_.hidden_size)});
+        m_mem_requests_bak.push_back({(void **)&grad_gate_lora_B_bc_ptr[i],
+            T::BufferC::required_size(config_.intermediate_size, padded_lora_rank_)});
 
         // Up projection LoRA buffers
-        lora_up_inter_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.max_len, padded_lora_rank_),
-            "lora_up_inter_bc");
-        lora_up_grad_ba_ptr[i] = alloc_buffer(
-            T::BufferA::required_size(config_.max_len, config_.intermediate_size),
-            "lora_up_grad_ba");
-        lora_up_temp_grad_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.max_len, padded_lora_rank_),
-            "lora_up_temp_grad_bc");
-        lora_up_A_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(padded_lora_rank_, config_.hidden_size),
-            "lora_up_A_bb");
-        lora_up_B_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(config_.intermediate_size, padded_lora_rank_),
-            "lora_up_B_bb");
-        lora_up_B_t_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(padded_lora_rank_, config_.intermediate_size),
-            "lora_up_B_t_bb");  // transposed: [padded_rank, intermediate]
-        grad_up_lora_A_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(padded_lora_rank_, config_.hidden_size),
-            "grad_up_lora_A_bc");
-        grad_up_lora_B_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.intermediate_size, padded_lora_rank_),
-            "grad_up_lora_B_bc");
+        m_mem_requests_bak.push_back({(void **)&lora_up_inter_bc_ptr[i],
+            T::BufferC::required_size(config_.max_len, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_up_grad_ba_ptr[i],
+            T::BufferA::required_size(config_.max_len, config_.intermediate_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_up_temp_grad_bc_ptr[i],
+            T::BufferC::required_size(config_.max_len, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_up_A_bb_ptr[i],
+            T::BufferB::required_size(padded_lora_rank_, config_.hidden_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_up_B_bb_ptr[i],
+            T::BufferB::required_size(config_.intermediate_size, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_up_B_t_bb_ptr[i],
+            T::BufferB::required_size(padded_lora_rank_, config_.intermediate_size)});
+        m_mem_requests_bak.push_back({(void **)&grad_up_lora_A_bc_ptr[i],
+            T::BufferC::required_size(padded_lora_rank_, config_.hidden_size)});
+        m_mem_requests_bak.push_back({(void **)&grad_up_lora_B_bc_ptr[i],
+            T::BufferC::required_size(config_.intermediate_size, padded_lora_rank_)});
 
         // Down projection LoRA buffers
-        lora_down_inter_ba_ptr[i] = alloc_buffer(
-            T::BufferA::required_size(config_.max_len, config_.intermediate_size),
-            "lora_down_inter_ba");
-        lora_down_lora_inter_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.max_len, padded_lora_rank_),
-            "lora_down_lora_inter_bc");
-        lora_down_grad_ba_ptr[i] = alloc_buffer(
-            T::BufferA::required_size(config_.max_len, config_.hidden_size),
-            "lora_down_grad_ba");
-        lora_down_temp_grad_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.max_len, padded_lora_rank_),
-            "lora_down_temp_grad_bc");
-        lora_down_A_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(padded_lora_rank_, config_.intermediate_size),
-            "lora_down_A_bb");
-        lora_down_B_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(config_.hidden_size, padded_lora_rank_),
-            "lora_down_B_bb");
-        lora_down_B_t_bb_ptr[i] = alloc_buffer(
-            T::BufferB::required_size(padded_lora_rank_, config_.hidden_size),
-            "lora_down_B_t_bb");  // transposed: [padded_rank, hidden]
-        grad_down_lora_A_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(padded_lora_rank_, config_.intermediate_size),
-            "grad_down_lora_A_bc");
-        grad_down_lora_B_bc_ptr[i] = alloc_buffer(
-            T::BufferC::required_size(config_.hidden_size, padded_lora_rank_),
-            "grad_down_lora_B_bc");
+        m_mem_requests_bak.push_back({(void **)&lora_down_inter_ba_ptr[i],
+            T::BufferA::required_size(config_.max_len, config_.intermediate_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_down_lora_inter_bc_ptr[i],
+            T::BufferC::required_size(config_.max_len, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_down_grad_ba_ptr[i],
+            T::BufferA::required_size(config_.max_len, config_.hidden_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_down_temp_grad_bc_ptr[i],
+            T::BufferC::required_size(config_.max_len, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_down_A_bb_ptr[i],
+            T::BufferB::required_size(padded_lora_rank_, config_.intermediate_size)});
+        m_mem_requests_bak.push_back({(void **)&lora_down_B_bb_ptr[i],
+            T::BufferB::required_size(config_.hidden_size, padded_lora_rank_)});
+        m_mem_requests_bak.push_back({(void **)&lora_down_B_t_bb_ptr[i],
+            T::BufferB::required_size(padded_lora_rank_, config_.hidden_size)});
+        m_mem_requests_bak.push_back({(void **)&grad_down_lora_A_bc_ptr[i],
+            T::BufferC::required_size(padded_lora_rank_, config_.intermediate_size)});
+        m_mem_requests_bak.push_back({(void **)&grad_down_lora_B_bc_ptr[i],
+            T::BufferC::required_size(config_.hidden_size, padded_lora_rank_)});
       }
     }
 
@@ -543,25 +550,6 @@ public:
 
     // Initialize AMX buffers
     for (uint64_t i = 0; i < config_.expert_num; i++) {
-      gate_up_ba_.push_back(
-          std::make_shared<typename T::BufferA>(config_.max_len, config_.hidden_size, gate_up_ba_ptr[i]));
-      gate_bc_.push_back(
-          std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, gate_bc_ptr[i]));
-      up_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, up_bc_ptr[i]));
-      down_ba_.push_back(
-          std::make_shared<typename T::BufferA>(config_.max_len, config_.intermediate_size, down_ba_ptr[i]));
-      down_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.hidden_size, down_bc_ptr[i]));
-
-      gate_t_ba_.push_back(
-          std::make_shared<typename T::BufferA>(config_.max_len, config_.intermediate_size, gate_t_ba_ptr[i]));
-      gate_t_bc_.push_back(
-          std::make_shared<typename T::BufferC>(config_.max_len, config_.hidden_size, gate_t_bc_ptr[i]));
-      up_t_ba_.push_back(std::make_shared<typename T::BufferA>(config_.max_len, config_.intermediate_size, up_t_ba_ptr[i]));
-      up_t_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.hidden_size, up_t_bc_ptr[i]));
-      down_t_ba_.push_back(
-          std::make_shared<typename T::BufferA>(config_.max_len, config_.hidden_size, down_t_ba_ptr[i]));
-      down_t_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, down_t_bc_ptr[i]));
-
 #ifdef USE_NUMA
       int numa_nodes = numa_num_configured_nodes();
       gate_bb_numa_.resize(numa_nodes);
@@ -629,67 +617,6 @@ public:
       down_t_bb_.push_back(
           std::make_shared<typename T::BufferB>(config_.intermediate_size, config_.hidden_size, down_t_bb_ptr));
 #endif
-
-      // Initialize LoRA gradient buffers (only if lora_rank > 0)
-      if (config_.lora_rank > 0) {
-        // Gate projection LoRA buffers
-        lora_gate_input_ba_.push_back(std::make_shared<typename T::BufferA>(
-            config_.max_len, config_.hidden_size, lora_gate_input_ba_ptr[i]));
-        lora_gate_inter_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.max_len, padded_lora_rank_, lora_gate_inter_bc_ptr[i]));
-        lora_gate_grad_ba_.push_back(std::make_shared<typename T::BufferA>(
-            config_.max_len, config_.intermediate_size, lora_gate_grad_ba_ptr[i]));
-        lora_gate_temp_grad_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.max_len, padded_lora_rank_, lora_gate_temp_grad_bc_ptr[i]));
-        lora_gate_A_bb_.push_back(std::make_shared<typename T::BufferB>(
-            padded_lora_rank_, config_.hidden_size, lora_gate_A_bb_ptr[i]));
-        lora_gate_B_bb_.push_back(std::make_shared<typename T::BufferB>(
-            config_.intermediate_size, padded_lora_rank_, lora_gate_B_bb_ptr[i]));
-        lora_gate_B_t_bb_.push_back(std::make_shared<typename T::BufferB>(
-            padded_lora_rank_, config_.intermediate_size, lora_gate_B_t_bb_ptr[i]));  // transposed
-        grad_gate_lora_A_bc_.push_back(std::make_shared<typename T::BufferC>(
-            padded_lora_rank_, config_.hidden_size, grad_gate_lora_A_bc_ptr[i]));
-        grad_gate_lora_B_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.intermediate_size, padded_lora_rank_, grad_gate_lora_B_bc_ptr[i]));
-
-        // Up projection LoRA buffers
-        lora_up_inter_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.max_len, padded_lora_rank_, lora_up_inter_bc_ptr[i]));
-        lora_up_grad_ba_.push_back(std::make_shared<typename T::BufferA>(
-            config_.max_len, config_.intermediate_size, lora_up_grad_ba_ptr[i]));
-        lora_up_temp_grad_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.max_len, padded_lora_rank_, lora_up_temp_grad_bc_ptr[i]));
-        lora_up_A_bb_.push_back(std::make_shared<typename T::BufferB>(
-            padded_lora_rank_, config_.hidden_size, lora_up_A_bb_ptr[i]));
-        lora_up_B_bb_.push_back(std::make_shared<typename T::BufferB>(
-            config_.intermediate_size, padded_lora_rank_, lora_up_B_bb_ptr[i]));
-        lora_up_B_t_bb_.push_back(std::make_shared<typename T::BufferB>(
-            padded_lora_rank_, config_.intermediate_size, lora_up_B_t_bb_ptr[i]));  // transposed
-        grad_up_lora_A_bc_.push_back(std::make_shared<typename T::BufferC>(
-            padded_lora_rank_, config_.hidden_size, grad_up_lora_A_bc_ptr[i]));
-        grad_up_lora_B_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.intermediate_size, padded_lora_rank_, grad_up_lora_B_bc_ptr[i]));
-
-        // Down projection LoRA buffers
-        lora_down_inter_ba_.push_back(std::make_shared<typename T::BufferA>(
-            config_.max_len, config_.intermediate_size, lora_down_inter_ba_ptr[i]));
-        lora_down_lora_inter_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.max_len, padded_lora_rank_, lora_down_lora_inter_bc_ptr[i]));
-        lora_down_grad_ba_.push_back(std::make_shared<typename T::BufferA>(
-            config_.max_len, config_.hidden_size, lora_down_grad_ba_ptr[i]));
-        lora_down_temp_grad_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.max_len, padded_lora_rank_, lora_down_temp_grad_bc_ptr[i]));
-        lora_down_A_bb_.push_back(std::make_shared<typename T::BufferB>(
-            padded_lora_rank_, config_.intermediate_size, lora_down_A_bb_ptr[i]));
-        lora_down_B_bb_.push_back(std::make_shared<typename T::BufferB>(
-            config_.hidden_size, padded_lora_rank_, lora_down_B_bb_ptr[i]));
-        lora_down_B_t_bb_.push_back(std::make_shared<typename T::BufferB>(
-            padded_lora_rank_, config_.hidden_size, lora_down_B_t_bb_ptr[i]));  // transposed
-        grad_down_lora_A_bc_.push_back(std::make_shared<typename T::BufferC>(
-            padded_lora_rank_, config_.intermediate_size, grad_down_lora_A_bc_ptr[i]));
-        grad_down_lora_B_bc_.push_back(std::make_shared<typename T::BufferC>(
-            config_.hidden_size, padded_lora_rank_, grad_down_lora_B_bc_ptr[i]));
-      }
     }
   }
 
@@ -906,6 +833,27 @@ public:
     bool use_amx = (qlen > 4 * config_.expert_num / config_.routed_expert_num);
     int activated_expert = 0;
 
+    shared_mem_buffer.alloc(this, m_mem_requests_fwd);
+
+    std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
+    std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
+    std::vector<std::shared_ptr<typename T::BufferC>> up_bc_;
+    std::vector<std::shared_ptr<typename T::BufferA>> down_ba_;
+    std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
+    for (uint64_t i = 0; i < config_.expert_num; i++) {
+      gate_up_ba_.push_back(
+          std::make_shared<typename T::BufferA>(config_.max_len, config_.hidden_size, gate_up_ba_ptr[i]));
+      // printf("Allocated gate_up_ba_ for expert %lu at ptr %p\n", i, gate_up_ba_ptr[i]);
+      gate_bc_.push_back(
+          std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, gate_bc_ptr[i]));
+      // printf("Allocated gate_bc_ for expert %lu at ptr %p\n", i, gate_bc_ptr[i]);
+      up_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, up_bc_ptr[i]));
+      // printf("Allocated up/_bc_ for expert %lu at ptr %p\n", i, up_bc_ptr[i]);
+      down_ba_.push_back(std::make_shared<typename T::BufferA>(config_.max_len, config_.intermediate_size, down_ba_ptr[i]));
+      // printf("Allocated down_ba_ for expert %lu at ptr %p\n", i, down_ba_ptr[i]);
+      down_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.hidden_size, down_bc_ptr[i]));
+      // printf("Allocated down_bc_ for expert %lu at ptr %p\n", i, down_bc_ptr[i]);
+    }
     // Count tokens per expert
     for (int i = 0; i < config_.expert_num; i++) {
       m_local_num_[i] = 0;
@@ -1039,6 +987,8 @@ public:
           }
         },
         nullptr);
+
+    shared_mem_buffer.dealloc(this);
   }
 
   /**
@@ -1046,10 +996,139 @@ public:
    * Same interface as SFT_AMX_MOE for compatibility
    */
   void backward(int qlen, int k, const uint64_t *expert_ids, const float *weights, const void* input,
-                const void *output_grad, void *input_grad, Backend *backend) {
+                const void *output_grad, void *input_grad, void *grad_weights, Backend *backend) {
+
     bool use_amx = (qlen > 4 * config_.expert_num / config_.routed_expert_num);
     int activated_expert = 0;
 
+    std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
+    std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
+    std::vector<std::shared_ptr<typename T::BufferC>> up_bc_;
+
+
+    std::vector<std::shared_ptr<typename T::BufferA>> gate_t_ba_;
+    std::vector<std::shared_ptr<typename T::BufferC>> gate_t_bc_;
+    std::vector<std::shared_ptr<typename T::BufferA>> up_t_ba_;
+    std::vector<std::shared_ptr<typename T::BufferC>> up_t_bc_;
+    std::vector<std::shared_ptr<typename T::BufferA>> down_t_ba_;
+    std::vector<std::shared_ptr<typename T::BufferC>> down_t_bc_;
+    
+
+        // Gate projection LoRA buffers
+      std::vector<std::shared_ptr<typename T::BufferA>> lora_gate_input_ba_;       // [num_tokens, hidden_size]
+      std::vector<std::shared_ptr<typename T::BufferC>> lora_gate_inter_bc_;       // [num_tokens, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferA>> lora_gate_grad_ba_;        // [num_tokens, intermediate_size]
+      std::vector<std::shared_ptr<typename T::BufferC>> lora_gate_temp_grad_bc_;   // [num_tokens, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_A_bb_;           // [padded_rank, hidden_size]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_B_bb_;           // [intermediate_size, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_B_t_bb_;         // [padded_rank, intermediate_size] - transposed for grad_A computation
+      std::vector<std::shared_ptr<typename T::BufferC>> grad_gate_lora_A_bc_;      // [padded_rank, hidden_size]
+      std::vector<std::shared_ptr<typename T::BufferC>> grad_gate_lora_B_bc_;      // [intermediate_size, padded_rank]
+
+      // Up projection LoRA buffers
+      std::vector<std::shared_ptr<typename T::BufferC>> lora_up_inter_bc_;         // [num_tokens, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferA>> lora_up_grad_ba_;          // [num_tokens, intermediate_size]
+      std::vector<std::shared_ptr<typename T::BufferC>> lora_up_temp_grad_bc_;     // [num_tokens, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_up_A_bb_;             // [padded_rank, hidden_size]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_up_B_bb_;             // [intermediate_size, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_up_B_t_bb_;           // [padded_rank, intermediate_size] - transposed for grad_A computation
+      std::vector<std::shared_ptr<typename T::BufferC>> grad_up_lora_A_bc_;        // [padded_rank, hidden_size]
+      std::vector<std::shared_ptr<typename T::BufferC>> grad_up_lora_B_bc_;        // [intermediate_size, padded_rank]
+
+      // Down projection LoRA buffers
+      std::vector<std::shared_ptr<typename T::BufferA>> lora_down_inter_ba_;       // [num_tokens, intermediate_size] (intermediate = silu(gate) * up)
+      std::vector<std::shared_ptr<typename T::BufferC>> lora_down_lora_inter_bc_;  // [num_tokens, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferA>> lora_down_grad_ba_;        // [num_tokens, hidden_size]
+      std::vector<std::shared_ptr<typename T::BufferC>> lora_down_temp_grad_bc_;   // [num_tokens, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_down_A_bb_;           // [padded_rank, intermediate_size]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_down_B_bb_;           // [hidden_size, padded_rank]
+      std::vector<std::shared_ptr<typename T::BufferB>> lora_down_B_t_bb_;         // [padded_rank, hidden_size] - transposed for grad_A computation
+      std::vector<std::shared_ptr<typename T::BufferC>> grad_down_lora_A_bc_;      // [padded_rank, intermediate_size]
+      std::vector<std::shared_ptr<typename T::BufferC>> grad_down_lora_B_bc_;      // [hidden_size, padded_rank]
+
+    shared_mem_buffer.alloc(this, m_mem_requests_bak);
+
+    for (uint64_t i = 0; i < config_.expert_num; i++) {
+      gate_up_ba_.push_back(
+          std::make_shared<typename T::BufferA>(config_.max_len, config_.hidden_size, gate_up_ba_ptr[i]));
+      // printf("Allocated gate_up_ba_ for expert %lu at ptr %p\n", i, gate_up_ba_ptr[i]);
+      gate_bc_.push_back(
+          std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, gate_bc_ptr[i]));
+      // printf("Allocated gate_bc_ for expert %lu at ptr %p\n", i, gate_bc_ptr[i]);
+      up_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, up_bc_ptr[i]));
+      // printf("Allocated up_bc_ for expert %lu at ptr %p\n", i, up_bc_ptr[i]);
+
+      gate_t_ba_.push_back(
+          std::make_shared<typename T::BufferA>(config_.max_len, config_.intermediate_size, gate_t_ba_ptr[i]));
+      gate_t_bc_.push_back(
+          std::make_shared<typename T::BufferC>(config_.max_len, config_.hidden_size, gate_t_bc_ptr[i]));
+      up_t_ba_.push_back(std::make_shared<typename T::BufferA>(config_.max_len, config_.intermediate_size, up_t_ba_ptr[i]));
+      up_t_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.hidden_size, up_t_bc_ptr[i]));
+      down_t_ba_.push_back(
+          std::make_shared<typename T::BufferA>(config_.max_len, config_.hidden_size, down_t_ba_ptr[i]));
+      down_t_bc_.push_back(std::make_shared<typename T::BufferC>(config_.max_len, config_.intermediate_size, down_t_bc_ptr[i]));
+
+      // Initialize LoRA gradient buffers (only if lora_rank > 0)
+      if (config_.lora_rank > 0) {
+        // Gate projection LoRA buffers
+        lora_gate_input_ba_.push_back(std::make_shared<typename T::BufferA>(
+            config_.max_len, config_.hidden_size, lora_gate_input_ba_ptr[i]));
+        lora_gate_inter_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.max_len, padded_lora_rank_, lora_gate_inter_bc_ptr[i]));
+        lora_gate_grad_ba_.push_back(std::make_shared<typename T::BufferA>(
+            config_.max_len, config_.intermediate_size, lora_gate_grad_ba_ptr[i]));
+        lora_gate_temp_grad_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.max_len, padded_lora_rank_, lora_gate_temp_grad_bc_ptr[i]));
+        lora_gate_A_bb_.push_back(std::make_shared<typename T::BufferB>(
+            padded_lora_rank_, config_.hidden_size, lora_gate_A_bb_ptr[i]));
+        lora_gate_B_bb_.push_back(std::make_shared<typename T::BufferB>(
+            config_.intermediate_size, padded_lora_rank_, lora_gate_B_bb_ptr[i]));
+        lora_gate_B_t_bb_.push_back(std::make_shared<typename T::BufferB>(
+            padded_lora_rank_, config_.intermediate_size, lora_gate_B_t_bb_ptr[i]));
+        grad_gate_lora_A_bc_.push_back(std::make_shared<typename T::BufferC>(
+            padded_lora_rank_, config_.hidden_size, grad_gate_lora_A_bc_ptr[i]));
+        grad_gate_lora_B_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.intermediate_size, padded_lora_rank_, grad_gate_lora_B_bc_ptr[i]));
+
+        // Up projection LoRA buffers
+        lora_up_inter_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.max_len, padded_lora_rank_, lora_up_inter_bc_ptr[i]));
+        lora_up_grad_ba_.push_back(std::make_shared<typename T::BufferA>(
+            config_.max_len, config_.intermediate_size, lora_up_grad_ba_ptr[i]));
+        lora_up_temp_grad_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.max_len, padded_lora_rank_, lora_up_temp_grad_bc_ptr[i]));
+        lora_up_A_bb_.push_back(std::make_shared<typename T::BufferB>(
+            padded_lora_rank_, config_.hidden_size, lora_up_A_bb_ptr[i]));
+        lora_up_B_bb_.push_back(std::make_shared<typename T::BufferB>(
+            config_.intermediate_size, padded_lora_rank_, lora_up_B_bb_ptr[i]));
+        lora_up_B_t_bb_.push_back(std::make_shared<typename T::BufferB>(
+            padded_lora_rank_, config_.intermediate_size, lora_up_B_t_bb_ptr[i]));
+        grad_up_lora_A_bc_.push_back(std::make_shared<typename T::BufferC>(
+            padded_lora_rank_, config_.hidden_size, grad_up_lora_A_bc_ptr[i]));
+        grad_up_lora_B_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.intermediate_size, padded_lora_rank_, grad_up_lora_B_bc_ptr[i]));
+
+        // Down projection LoRA buffers
+        lora_down_inter_ba_.push_back(std::make_shared<typename T::BufferA>(
+            config_.max_len, config_.intermediate_size, lora_down_inter_ba_ptr[i]));
+        lora_down_lora_inter_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.max_len, padded_lora_rank_, lora_down_lora_inter_bc_ptr[i]));
+        lora_down_grad_ba_.push_back(std::make_shared<typename T::BufferA>(
+            config_.max_len, config_.hidden_size, lora_down_grad_ba_ptr[i]));
+        lora_down_temp_grad_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.max_len, padded_lora_rank_, lora_down_temp_grad_bc_ptr[i]));
+        lora_down_A_bb_.push_back(std::make_shared<typename T::BufferB>(
+            padded_lora_rank_, config_.intermediate_size, lora_down_A_bb_ptr[i]));
+        lora_down_B_bb_.push_back(std::make_shared<typename T::BufferB>(
+            config_.hidden_size, padded_lora_rank_, lora_down_B_bb_ptr[i]));
+        lora_down_B_t_bb_.push_back(std::make_shared<typename T::BufferB>(
+            padded_lora_rank_, config_.hidden_size, lora_down_B_t_bb_ptr[i]));
+        grad_down_lora_A_bc_.push_back(std::make_shared<typename T::BufferC>(
+            padded_lora_rank_, config_.intermediate_size, grad_down_lora_A_bc_ptr[i]));
+        grad_down_lora_B_bc_.push_back(std::make_shared<typename T::BufferC>(
+            config_.hidden_size, padded_lora_rank_, grad_down_lora_B_bc_ptr[i]));
+      }
+    }
     // Count tokens per expert (same as forward)
     for (int i = 0; i < config_.expert_num; i++) {
       m_local_num_[i] = 0;
@@ -1193,6 +1272,46 @@ public:
           up_t_ba_[expert_idx]->from_mat(m_local_num_[expert_idx], m_local_up_output_grad_ptr_[expert_idx], 0, 1);
         },
         nullptr);
+
+  backend->do_work_stealing_job(
+    activated_expert, nullptr,
+    [&](int task_id) {
+      int expert_idx = m_expert_id_map_[task_id];
+      int num_tokens = m_local_num_[expert_idx];
+      if (num_tokens == 0) return;
+
+      for (int t = 0; t < num_tokens; ++t) {
+        int token_idx  = m_local_token_indices_ptr_[expert_idx][t];
+        int expert_pos = m_local_expert_positions_ptr_[expert_idx][t];
+
+        ggml_bf16_t *p_ptr    = &m_local_down_input_grad_ptr_[expert_idx][t * config_.intermediate_size];
+        ggml_bf16_t *gate_ptr = &m_local_gate_output_ptr_[expert_idx][t * config_.intermediate_size];
+        ggml_bf16_t *up_ptr   = &m_local_up_output_ptr_[expert_idx][t * config_.intermediate_size];
+
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+
+        
+        for (int d = 0; d + 32 <= config_.intermediate_size; d += 32) {
+          __m512 g0, g1, u0, u1, p0, p1;
+          avx512_32xbf16_to_32xfp32((__m512i *)(gate_ptr + d), &g0, &g1);
+          avx512_32xbf16_to_32xfp32((__m512i *)(up_ptr   + d), &u0, &u1);
+          avx512_32xbf16_to_32xfp32((__m512i *)(p_ptr    + d), &p0, &p1);
+
+          // z = silu(gate) * up
+          __m512 z0 = _mm512_mul_ps(act_fn_route(g0), u0);
+          __m512 z1 = _mm512_mul_ps(act_fn_route(g1), u1);
+
+          // dot += p * z
+          acc0 = _mm512_fmadd_ps(p0, z0, acc0);
+          acc1 = _mm512_fmadd_ps(p1, z1, acc1);
+        }
+
+        ((float*)grad_weights)[token_idx * k + expert_pos] =  _mm512_reduce_add_ps(acc0) + _mm512_reduce_add_ps(acc1);
+      }
+    },
+    nullptr);
+
 
     nth = T::recommended_nth(config_.hidden_size);
     backend->do_work_stealing_job(
@@ -1775,6 +1894,8 @@ public:
           }
         },
         nullptr);
+
+    shared_mem_buffer.dealloc(this);
   }
 };
 
