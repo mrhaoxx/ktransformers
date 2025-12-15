@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -136,16 +137,6 @@ private:
   void *up_lora_B_;
   void *down_lora_A_;
   void *down_lora_B_;
-
-  // Merged weights (base + LoRA) for forward pass
-  void *gate_proj_merged_;
-  void *up_proj_merged_;
-  void *down_proj_merged_;
-
-  // Transposed weights for backward pass
-  void *gate_proj_t_;
-  void *up_proj_t_;
-  void *down_proj_t_;
 
   // Local buffers for token packing
   ggml_bf16_t *m_local_input_;
@@ -377,26 +368,26 @@ public:
         sizeof(int) * config_.routed_expert_num * config_.max_len});
 
     // Merged weights
-    gate_proj_merged_ = alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
-        "gate_proj_merged_");
-    up_proj_merged_ = alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
-        "up_proj_merged_");
-    down_proj_merged_ = alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.expert_num * config_.hidden_size * config_.intermediate_size,
-        "down_proj_merged_");
+    // gate_proj_merged_ = alloc_buffer(
+    //     sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
+    //     "gate_proj_merged_");
+    // up_proj_merged_ = alloc_buffer(
+    //     sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
+    //     "up_proj_merged_");
+    // down_proj_merged_ = alloc_buffer(
+    //     sizeof(ggml_bf16_t) * config_.expert_num * config_.hidden_size * config_.intermediate_size,
+    //     "down_proj_merged_");
 
-    // Transposed weights
-    gate_proj_t_ = alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
-        "gate_proj_t_");
-    up_proj_t_ = alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
-        "up_proj_t_");
-    down_proj_t_ = alloc_buffer(
-        sizeof(ggml_bf16_t) * config_.expert_num * config_.hidden_size * config_.intermediate_size,
-        "down_proj_t_");
+    // // Transposed weights
+    // gate_proj_t_ = alloc_buffer(
+    //     sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
+    //     "gate_proj_t_");
+    // up_proj_t_ = alloc_buffer(
+    //     sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size,
+    //     "up_proj_t_");
+    // down_proj_t_ = alloc_buffer(
+    //     sizeof(ggml_bf16_t) * config_.expert_num * config_.hidden_size * config_.intermediate_size,
+    //     "down_proj_t_");
 
     // AMX buffers - allocate independently for each expert
 
@@ -652,93 +643,100 @@ public:
         nullptr);
   }
 
-  /**
-   * Merge LoRA adapters with base weights: W = W_base + scaling * B @ A
-   */
-  void merge_lora_weights(Backend *backend) {
-    backend->do_work_stealing_job(
-        config_.expert_num, nullptr,
-        [&](int expert_idx) {
-          // NO cout inside lambda - it's not thread-safe!
-          // Merge gate_proj
-          ggml_bf16_t *gate_base = (ggml_bf16_t *)config_.gate_proj_base + expert_idx * config_.intermediate_size * config_.hidden_size;
-          ggml_bf16_t *gate_merged = (ggml_bf16_t *)gate_proj_merged_ + expert_idx * config_.intermediate_size * config_.hidden_size;
-          ggml_bf16_t *gate_A = (ggml_bf16_t *)config_.gate_lora_A + expert_idx * config_.lora_rank * config_.hidden_size;
-          ggml_bf16_t *gate_B = (ggml_bf16_t *)config_.gate_lora_B + expert_idx * config_.intermediate_size * config_.lora_rank;
+  // /**
+  //  * Merge LoRA adapters with base weights: W = W_base + scaling * B @ A
+  //  */
+  // void merge_lora_weights(Backend *backend) {
+  //   backend->do_work_stealing_job(
+  //       config_.expert_num, nullptr,
+  //       [&](int expert_idx) {
+  //         // NO cout inside lambda - it's not thread-safe!
+  //         // Merge gate_proj
+  //         ggml_bf16_t *gate_base = (ggml_bf16_t *)config_.gate_proj_base + expert_idx * config_.intermediate_size * config_.hidden_size;
+  //         ggml_bf16_t *gate_merged = (ggml_bf16_t *)gate_proj_merged_ + expert_idx * config_.intermediate_size * config_.hidden_size;
+  //         ggml_bf16_t *gate_A = (ggml_bf16_t *)config_.gate_lora_A + expert_idx * config_.lora_rank * config_.hidden_size;
+  //         ggml_bf16_t *gate_B = (ggml_bf16_t *)config_.gate_lora_B + expert_idx * config_.intermediate_size * config_.lora_rank;
 
-          // Copy base weight
-          memcpy(gate_merged, gate_base, config_.intermediate_size * config_.hidden_size * sizeof(ggml_bf16_t));
+  //         // Copy base weight
+  //         memcpy(gate_merged, gate_base, config_.intermediate_size * config_.hidden_size * sizeof(ggml_bf16_t));
 
-          // Add LoRA: W += scaling * B @ A
-          for (int i = 0; i < config_.intermediate_size; i++) {
-            for (int j = 0; j < config_.hidden_size; j++) {
-              float lora_delta = 0.0f;
-              for (int r = 0; r < config_.lora_rank; r++) {
-                float b_val = ggml_bf16_to_fp32(gate_B[i * config_.lora_rank + r]);
-                float a_val = ggml_bf16_to_fp32(gate_A[r * config_.hidden_size + j]);
-                lora_delta += b_val * a_val;
-              }
-              float base_val = ggml_bf16_to_fp32(gate_merged[i * config_.hidden_size + j]);
-              gate_merged[i * config_.hidden_size + j] = GGML_FP32_TO_BF16(base_val + config_.lora_scaling * lora_delta);
-            }
-          }
+  //         // Add LoRA: W += scaling * B @ A
+  //         for (int i = 0; i < config_.intermediate_size; i++) {
+  //           for (int j = 0; j < config_.hidden_size; j++) {
+  //             float lora_delta = 0.0f;
+  //             for (int r = 0; r < config_.lora_rank; r++) {
+  //               float b_val = ggml_bf16_to_fp32(gate_B[i * config_.lora_rank + r]);
+  //               float a_val = ggml_bf16_to_fp32(gate_A[r * config_.hidden_size + j]);
+  //               lora_delta += b_val * a_val;
+  //             }
+  //             float base_val = ggml_bf16_to_fp32(gate_merged[i * config_.hidden_size + j]);
+  //             gate_merged[i * config_.hidden_size + j] = GGML_FP32_TO_BF16(base_val + config_.lora_scaling * lora_delta);
+  //           }
+  //         }
 
-          // Merge up_proj
-          ggml_bf16_t *up_base = (ggml_bf16_t *)config_.up_proj_base + expert_idx * config_.intermediate_size * config_.hidden_size;
-          ggml_bf16_t *up_merged = (ggml_bf16_t *)up_proj_merged_ + expert_idx * config_.intermediate_size * config_.hidden_size;
-          ggml_bf16_t *up_A = (ggml_bf16_t *)config_.up_lora_A + expert_idx * config_.lora_rank * config_.hidden_size;
-          ggml_bf16_t *up_B = (ggml_bf16_t *)config_.up_lora_B + expert_idx * config_.intermediate_size * config_.lora_rank;
+  //         // Merge up_proj
+  //         ggml_bf16_t *up_base = (ggml_bf16_t *)config_.up_proj_base + expert_idx * config_.intermediate_size * config_.hidden_size;
+  //         ggml_bf16_t *up_merged = (ggml_bf16_t *)up_proj_merged_ + expert_idx * config_.intermediate_size * config_.hidden_size;
+  //         ggml_bf16_t *up_A = (ggml_bf16_t *)config_.up_lora_A + expert_idx * config_.lora_rank * config_.hidden_size;
+  //         ggml_bf16_t *up_B = (ggml_bf16_t *)config_.up_lora_B + expert_idx * config_.intermediate_size * config_.lora_rank;
 
-          memcpy(up_merged, up_base, config_.intermediate_size * config_.hidden_size * sizeof(ggml_bf16_t));
+  //         memcpy(up_merged, up_base, config_.intermediate_size * config_.hidden_size * sizeof(ggml_bf16_t));
 
-          for (int i = 0; i < config_.intermediate_size; i++) {
-            for (int j = 0; j < config_.hidden_size; j++) {
-              float lora_delta = 0.0f;
-              for (int r = 0; r < config_.lora_rank; r++) {
-                float b_val = ggml_bf16_to_fp32(up_B[i * config_.lora_rank + r]);
-                float a_val = ggml_bf16_to_fp32(up_A[r * config_.hidden_size + j]);
-                lora_delta += b_val * a_val;
-              }
-              float base_val = ggml_bf16_to_fp32(up_merged[i * config_.hidden_size + j]);
-              up_merged[i * config_.hidden_size + j] = GGML_FP32_TO_BF16(base_val + config_.lora_scaling * lora_delta);
-            }
-          }
+  //         for (int i = 0; i < config_.intermediate_size; i++) {
+  //           for (int j = 0; j < config_.hidden_size; j++) {
+  //             float lora_delta = 0.0f;
+  //             for (int r = 0; r < config_.lora_rank; r++) {
+  //               float b_val = ggml_bf16_to_fp32(up_B[i * config_.lora_rank + r]);
+  //               float a_val = ggml_bf16_to_fp32(up_A[r * config_.hidden_size + j]);
+  //               lora_delta += b_val * a_val;
+  //             }
+  //             float base_val = ggml_bf16_to_fp32(up_merged[i * config_.hidden_size + j]);
+  //             up_merged[i * config_.hidden_size + j] = GGML_FP32_TO_BF16(base_val + config_.lora_scaling * lora_delta);
+  //           }
+  //         }
 
-          // Merge down_proj
-          ggml_bf16_t *down_base = (ggml_bf16_t *)config_.down_proj_base + expert_idx * config_.hidden_size * config_.intermediate_size;
-          ggml_bf16_t *down_merged = (ggml_bf16_t *)down_proj_merged_ + expert_idx * config_.hidden_size * config_.intermediate_size;
-          ggml_bf16_t *down_A = (ggml_bf16_t *)config_.down_lora_A + expert_idx * config_.lora_rank * config_.intermediate_size;
-          ggml_bf16_t *down_B = (ggml_bf16_t *)config_.down_lora_B + expert_idx * config_.hidden_size * config_.lora_rank;
+  //         // Merge down_proj
+  //         ggml_bf16_t *down_base = (ggml_bf16_t *)config_.down_proj_base + expert_idx * config_.hidden_size * config_.intermediate_size;
+  //         ggml_bf16_t *down_merged = (ggml_bf16_t *)down_proj_merged_ + expert_idx * config_.hidden_size * config_.intermediate_size;
+  //         ggml_bf16_t *down_A = (ggml_bf16_t *)config_.down_lora_A + expert_idx * config_.lora_rank * config_.intermediate_size;
+  //         ggml_bf16_t *down_B = (ggml_bf16_t *)config_.down_lora_B + expert_idx * config_.hidden_size * config_.lora_rank;
 
-          memcpy(down_merged, down_base, config_.hidden_size * config_.intermediate_size * sizeof(ggml_bf16_t));
+  //         memcpy(down_merged, down_base, config_.hidden_size * config_.intermediate_size * sizeof(ggml_bf16_t));
 
-          for (int i = 0; i < config_.hidden_size; i++) {
-            for (int j = 0; j < config_.intermediate_size; j++) {
-              float lora_delta = 0.0f;
-              for (int r = 0; r < config_.lora_rank; r++) {
-                float b_val = ggml_bf16_to_fp32(down_B[i * config_.lora_rank + r]);
-                float a_val = ggml_bf16_to_fp32(down_A[r * config_.intermediate_size + j]);
-                lora_delta += b_val * a_val;
-              }
-              float base_val = ggml_bf16_to_fp32(down_merged[i * config_.intermediate_size + j]);
-              down_merged[i * config_.intermediate_size + j] = GGML_FP32_TO_BF16(base_val + config_.lora_scaling * lora_delta);
-            }
-          }
-        },
-        nullptr);
-  }
+  //         for (int i = 0; i < config_.hidden_size; i++) {
+  //           for (int j = 0; j < config_.intermediate_size; j++) {
+  //             float lora_delta = 0.0f;
+  //             for (int r = 0; r < config_.lora_rank; r++) {
+  //               float b_val = ggml_bf16_to_fp32(down_B[i * config_.lora_rank + r]);
+  //               float a_val = ggml_bf16_to_fp32(down_A[r * config_.intermediate_size + j]);
+  //               lora_delta += b_val * a_val;
+  //             }
+  //             float base_val = ggml_bf16_to_fp32(down_merged[i * config_.intermediate_size + j]);
+  //             down_merged[i * config_.intermediate_size + j] = GGML_FP32_TO_BF16(base_val + config_.lora_scaling * lora_delta);
+  //           }
+  //         }
+  //       },
+  //       nullptr);
+  // }
 
   /**
    * Load and prepare weights for inference
    */
   void load_weights(Backend *backend) {
     // Merge LoRA with base weights
-    merge_lora_weights(backend);
+    // merge_lora_weights(backend);
 
+    void *gate_proj_t_ = std::aligned_alloc(
+        64, sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size);
+    void *up_proj_t_ = std::aligned_alloc(
+        64, sizeof(ggml_bf16_t) * config_.expert_num * config_.intermediate_size * config_.hidden_size);
+    void *down_proj_t_ = std::aligned_alloc(
+        64, sizeof(ggml_bf16_t) * config_.expert_num * config_.hidden_size * config_.intermediate_size);
+        
     // Transpose merged weights for backward pass
-    transpose_expert(gate_proj_merged_, gate_proj_t_, config_.intermediate_size, config_.hidden_size, backend);
-    transpose_expert(up_proj_merged_, up_proj_t_, config_.intermediate_size, config_.hidden_size, backend);
-    transpose_expert(down_proj_merged_, down_proj_t_, config_.hidden_size, config_.intermediate_size, backend);
+    transpose_expert(gate_proj_base_, gate_proj_t_, config_.intermediate_size, config_.hidden_size, backend);
+    transpose_expert(up_proj_base_, up_proj_t_, config_.intermediate_size, config_.hidden_size, backend);
+    transpose_expert(down_proj_base_, down_proj_t_, config_.hidden_size, config_.intermediate_size, backend);
 
     // Load weights into AMX buffers
     int nth = T::recommended_nth(config_.intermediate_size);
@@ -750,19 +748,19 @@ public:
 #ifdef USE_NUMA
           int numa_nodes = numa_num_configured_nodes();
           for (int j = 0; j < numa_nodes; j++) {
-            gate_bb_numa_[j][expert_idx]->from_mat((ggml_bf16_t *)gate_proj_merged_ +
+            gate_bb_numa_[j][expert_idx]->from_mat((ggml_bf16_t *)gate_proj_base_ +
                                                        expert_idx * config_.intermediate_size * config_.hidden_size,
                                                    ith, nth);
-            up_bb_numa_[j][expert_idx]->from_mat((ggml_bf16_t *)up_proj_merged_ +
+            up_bb_numa_[j][expert_idx]->from_mat((ggml_bf16_t *)up_proj_base_ +
                                                      expert_idx * config_.intermediate_size * config_.hidden_size,
                                                  ith, nth);
           }
 #else
-          gate_bb_[expert_idx]->from_mat((ggml_bf16_t *)gate_proj_merged_ +
+          gate_bb_[expert_idx]->from_mat((ggml_bf16_t *)gate_proj_base_ +
                                              expert_idx * config_.intermediate_size * config_.hidden_size,
                                          ith, nth);
           up_bb_[expert_idx]->from_mat(
-              (ggml_bf16_t *)up_proj_merged_ + expert_idx * config_.intermediate_size * config_.hidden_size, ith, nth);
+              (ggml_bf16_t *)up_proj_base_ + expert_idx * config_.intermediate_size * config_.hidden_size, ith, nth);
 #endif
         },
         nullptr);
@@ -797,7 +795,7 @@ public:
 #ifdef USE_NUMA
           int numa_nodes = numa_num_configured_nodes();
           for (int j = 0; j < numa_nodes; j++) {
-            down_bb_numa_[j][expert_idx]->from_mat((ggml_bf16_t *)down_proj_merged_ +
+            down_bb_numa_[j][expert_idx]->from_mat((ggml_bf16_t *)down_proj_base_ +
                                                        expert_idx * config_.hidden_size * config_.intermediate_size,
                                                    ith, nth);
             gate_t_bb_numa_[j][expert_idx]->from_mat((ggml_bf16_t *)gate_proj_t_ +
@@ -808,7 +806,7 @@ public:
                                                    ith, nth);
           }
 #else
-          down_bb_[expert_idx]->from_mat((ggml_bf16_t *)down_proj_merged_ +
+          down_bb_[expert_idx]->from_mat((ggml_bf16_t *)down_proj_base_ +
                                              expert_idx * config_.hidden_size * config_.intermediate_size,
                                          ith, nth);
           gate_t_bb_[expert_idx]->from_mat((ggml_bf16_t *)gate_proj_t_ +
@@ -820,6 +818,10 @@ public:
 #endif
         },
         nullptr);
+
+        free(gate_proj_t_);
+        free(up_proj_t_);
+        free(down_proj_t_);
   }
 
   void warm_up(Backend *backend) {}
@@ -1005,46 +1007,74 @@ public:
     std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
     std::vector<std::shared_ptr<typename T::BufferC>> up_bc_;
 
-
     std::vector<std::shared_ptr<typename T::BufferA>> gate_t_ba_;
     std::vector<std::shared_ptr<typename T::BufferC>> gate_t_bc_;
     std::vector<std::shared_ptr<typename T::BufferA>> up_t_ba_;
     std::vector<std::shared_ptr<typename T::BufferC>> up_t_bc_;
     std::vector<std::shared_ptr<typename T::BufferA>> down_t_ba_;
     std::vector<std::shared_ptr<typename T::BufferC>> down_t_bc_;
-    
 
-        // Gate projection LoRA buffers
-      std::vector<std::shared_ptr<typename T::BufferA>> lora_gate_input_ba_;       // [num_tokens, hidden_size]
-      std::vector<std::shared_ptr<typename T::BufferC>> lora_gate_inter_bc_;       // [num_tokens, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferA>> lora_gate_grad_ba_;        // [num_tokens, intermediate_size]
-      std::vector<std::shared_ptr<typename T::BufferC>> lora_gate_temp_grad_bc_;   // [num_tokens, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_A_bb_;           // [padded_rank, hidden_size]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_B_bb_;           // [intermediate_size, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_gate_B_t_bb_;         // [padded_rank, intermediate_size] - transposed for grad_A computation
-      std::vector<std::shared_ptr<typename T::BufferC>> grad_gate_lora_A_bc_;      // [padded_rank, hidden_size]
-      std::vector<std::shared_ptr<typename T::BufferC>> grad_gate_lora_B_bc_;      // [intermediate_size, padded_rank]
+    // Gate projection LoRA buffers
+    std::vector<std::shared_ptr<typename T::BufferA>>
+        lora_gate_input_ba_; // [num_tokens, hidden_size]
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        lora_gate_inter_bc_; // [num_tokens, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferA>>
+        lora_gate_grad_ba_; // [num_tokens, intermediate_size]
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        lora_gate_temp_grad_bc_; // [num_tokens, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_gate_A_bb_; // [padded_rank, hidden_size]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_gate_B_bb_; // [intermediate_size, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_gate_B_t_bb_; // [padded_rank, intermediate_size] - transposed for
+                           // grad_A computation
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        grad_gate_lora_A_bc_; // [padded_rank, hidden_size]
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        grad_gate_lora_B_bc_; // [intermediate_size, padded_rank]
 
-      // Up projection LoRA buffers
-      std::vector<std::shared_ptr<typename T::BufferC>> lora_up_inter_bc_;         // [num_tokens, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferA>> lora_up_grad_ba_;          // [num_tokens, intermediate_size]
-      std::vector<std::shared_ptr<typename T::BufferC>> lora_up_temp_grad_bc_;     // [num_tokens, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_up_A_bb_;             // [padded_rank, hidden_size]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_up_B_bb_;             // [intermediate_size, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_up_B_t_bb_;           // [padded_rank, intermediate_size] - transposed for grad_A computation
-      std::vector<std::shared_ptr<typename T::BufferC>> grad_up_lora_A_bc_;        // [padded_rank, hidden_size]
-      std::vector<std::shared_ptr<typename T::BufferC>> grad_up_lora_B_bc_;        // [intermediate_size, padded_rank]
+    // Up projection LoRA buffers
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        lora_up_inter_bc_; // [num_tokens, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferA>>
+        lora_up_grad_ba_; // [num_tokens, intermediate_size]
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        lora_up_temp_grad_bc_; // [num_tokens, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_up_A_bb_; // [padded_rank, hidden_size]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_up_B_bb_; // [intermediate_size, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_up_B_t_bb_; // [padded_rank, intermediate_size] - transposed for
+                         // grad_A computation
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        grad_up_lora_A_bc_; // [padded_rank, hidden_size]
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        grad_up_lora_B_bc_; // [intermediate_size, padded_rank]
 
-      // Down projection LoRA buffers
-      std::vector<std::shared_ptr<typename T::BufferA>> lora_down_inter_ba_;       // [num_tokens, intermediate_size] (intermediate = silu(gate) * up)
-      std::vector<std::shared_ptr<typename T::BufferC>> lora_down_lora_inter_bc_;  // [num_tokens, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferA>> lora_down_grad_ba_;        // [num_tokens, hidden_size]
-      std::vector<std::shared_ptr<typename T::BufferC>> lora_down_temp_grad_bc_;   // [num_tokens, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_down_A_bb_;           // [padded_rank, intermediate_size]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_down_B_bb_;           // [hidden_size, padded_rank]
-      std::vector<std::shared_ptr<typename T::BufferB>> lora_down_B_t_bb_;         // [padded_rank, hidden_size] - transposed for grad_A computation
-      std::vector<std::shared_ptr<typename T::BufferC>> grad_down_lora_A_bc_;      // [padded_rank, intermediate_size]
-      std::vector<std::shared_ptr<typename T::BufferC>> grad_down_lora_B_bc_;      // [hidden_size, padded_rank]
+    // Down projection LoRA buffers
+    std::vector<std::shared_ptr<typename T::BufferA>>
+        lora_down_inter_ba_; // [num_tokens, intermediate_size] (intermediate =
+                             // silu(gate) * up)
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        lora_down_lora_inter_bc_; // [num_tokens, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferA>>
+        lora_down_grad_ba_; // [num_tokens, hidden_size]
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        lora_down_temp_grad_bc_; // [num_tokens, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_down_A_bb_; // [padded_rank, intermediate_size]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_down_B_bb_; // [hidden_size, padded_rank]
+    std::vector<std::shared_ptr<typename T::BufferB>>
+        lora_down_B_t_bb_; // [padded_rank, hidden_size] - transposed for grad_A
+                           // computation
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        grad_down_lora_A_bc_; // [padded_rank, intermediate_size]
+    std::vector<std::shared_ptr<typename T::BufferC>>
+        grad_down_lora_B_bc_; // [hidden_size, padded_rank]
 
     shared_mem_buffer.alloc(this, m_mem_requests_bak);
 
