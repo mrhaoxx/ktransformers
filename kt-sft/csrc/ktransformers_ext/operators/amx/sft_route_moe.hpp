@@ -104,15 +104,32 @@ static void dump_bf16_matrix(const char* name, int expert_id,
   file.write(reinterpret_cast<const char*>(&rows), sizeof(int));
   file.write(reinterpret_cast<const char*>(&cols), sizeof(int));
 
-  // Convert bf16 to f32 and write
+  // Convert bf16 to f32 and check for NaN
   std::vector<float> f32_data(rows * cols);
+  std::vector<std::pair<int, int>> nan_positions;
   for (int i = 0; i < rows * cols; i++) {
     f32_data[i] = GGML_BF16_TO_FP32(data[i]);
+    if (std::isnan(f32_data[i]) || std::isinf(f32_data[i])) {
+      int row = i / cols;
+      int col = i % cols;
+      nan_positions.push_back({row, col});
+    }
   }
   file.write(reinterpret_cast<const char*>(f32_data.data()),
              sizeof(float) * rows * cols);
 
   printf("[DUMP] Wrote %s: [%d x %d]\n", filename, rows, cols);
+
+  // Check for NaN/Inf and throw exception
+  if (!nan_positions.empty()) {
+    printf("[DUMP] ERROR: Found %zu NaN/Inf values in %s!\n", nan_positions.size(), filename);
+    printf("[DUMP] First 10 NaN/Inf positions:\n");
+    for (size_t i = 0; i < std::min(nan_positions.size(), (size_t)10); i++) {
+      printf("  [%d, %d] = %f\n", nan_positions[i].first, nan_positions[i].second,
+             f32_data[nan_positions[i].first * cols + nan_positions[i].second]);
+    }
+    throw std::runtime_error(std::string("[DUMP] NaN/Inf detected in ") + filename);
+  }
 }
 
 // Dump BufferA (AMX layout) to bf16 matrix
@@ -1182,12 +1199,26 @@ public:
 #ifdef USE_NUMA
       int numa_nodes = numa_num_configured_nodes();
       for (int j = 0; j < numa_nodes; j++) {
+        // lora_gate_A: N = padded_lora_rank_ <= 256, safe with (0, 1)
         lora_gate_A_bb_numa_[j][expert_idx]->from_mat(gate_A_padded, 0, 1);
-        lora_gate_B_bb_numa_[j][expert_idx]->from_mat(gate_B_padded, 0, 1);
+        // lora_gate_B: N = intermediate_size, may exceed N_BLOCK(256)
+        int nth_inter = T::recommended_nth(inter);
+        for (int ith = 0; ith < nth_inter; ith++) {
+          lora_gate_B_bb_numa_[j][expert_idx]->from_mat(gate_B_padded, ith, nth_inter);
+        }
+        // lora_up_A: N = padded_lora_rank_ <= 256, safe with (0, 1)
         lora_up_A_bb_numa_[j][expert_idx]->from_mat(up_A_padded, 0, 1);
-        lora_up_B_bb_numa_[j][expert_idx]->from_mat(up_B_padded, 0, 1);
+        // lora_up_B: N = intermediate_size, may exceed N_BLOCK(256)
+        for (int ith = 0; ith < nth_inter; ith++) {
+          lora_up_B_bb_numa_[j][expert_idx]->from_mat(up_B_padded, ith, nth_inter);
+        }
+        // lora_down_A: N = padded_lora_rank_ <= 256, safe with (0, 1)
         lora_down_A_bb_numa_[j][expert_idx]->from_mat(down_A_padded, 0, 1);
-        lora_down_B_bb_numa_[j][expert_idx]->from_mat(down_B_padded, 0, 1);
+        // lora_down_B: N = hidden_size, may exceed N_BLOCK(256)
+        int nth_hidden = T::recommended_nth(hidden);
+        for (int ith = 0; ith < nth_hidden; ith++) {
+          lora_down_B_bb_numa_[j][expert_idx]->from_mat(down_B_padded, ith, nth_hidden);
+        }
       }
 #else
       nth = T::recommended_nth(inter);
@@ -2093,7 +2124,14 @@ public:
 
             // Load to BufferB (will be transposed internally)
             lora_gate_A_bb_[expert_idx]->from_mat(gate_lora_A_padded, 0, 1);
-            lora_gate_B_bb_[expert_idx]->from_mat(gate_lora_B_padded, 0, 1);
+            // lora_gate_B_bb_ has N=intermediate_size which may exceed N_BLOCK(256)
+            // Need to call from_mat for each block
+            {
+              int nth_gate_B = T::recommended_nth(config_.intermediate_size);
+              for (int ith = 0; ith < nth_gate_B; ith++) {
+                lora_gate_B_bb_[expert_idx]->from_mat(gate_lora_B_padded, ith, nth_gate_B);
+              }
+            }
 
             // Create and load transposed lora_B for grad_A computation
             // gate_lora_B is [intermediate_size, padded_rank], need [padded_rank, intermediate_size]
@@ -2337,10 +2375,17 @@ public:
           if (m_local_num_[e] > 0) {
             ggml_bf16_t *gate_lora_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
             ggml_bf16_t *up_lora_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
-            lora_gate_output_bc_[e]->to_mat(m_local_num_[e], gate_lora_bf16, 0, 1);
-            lora_up_output_bc_[e]->to_mat(m_local_num_[e], up_lora_bf16, 0, 1);
+            // N_BLOCK=256, need to call to_mat for each block to export all columns
+            int n_blocks = (config_.intermediate_size + T::N_BLOCK - 1) / T::N_BLOCK;
+            for (int b = 0; b < n_blocks; b++) {
+              lora_gate_output_bc_[e]->to_mat(m_local_num_[e], gate_lora_bf16, b, n_blocks);
+              lora_up_output_bc_[e]->to_mat(m_local_num_[e], up_lora_bf16, b, n_blocks);
+            }
             dump_bf16_matrix("bwd_step2_gate_lora_output", e, gate_lora_bf16, m_local_num_[e], config_.intermediate_size);
             dump_bf16_matrix("bwd_step2_up_lora_output", e, up_lora_bf16, m_local_num_[e], config_.intermediate_size);
+            dump_buffer_b<T>("gate_bb_lora_B", e, gate_bb_lora_B_[e], config_.intermediate_size, padded_lora_rank_);
+            dump_buffer_a<T>("lora_gate_inter_ba_", e, lora_gate_inter_ba_[e], m_local_num_[e], padded_lora_rank_);
+
             free(gate_lora_bf16);
             free(up_lora_bf16);
           }
@@ -2455,10 +2500,14 @@ public:
         for (int e = 0; e < config_.expert_num; e++) {
           if (m_local_num_[e] > 0) {
             ggml_bf16_t *down_lora_grad_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
-            lora_down_temp_grad_inter_bc_[e]->to_mat(m_local_num_[e], down_lora_grad_bf16, 0, 1);
+            // N_BLOCK=256, need to call to_mat for each block to export all columns
+            int n_blocks = (config_.intermediate_size + T::N_BLOCK - 1) / T::N_BLOCK;
+            for (int b = 0; b < n_blocks; b++) {
+              lora_down_temp_grad_inter_bc_[e]->to_mat(m_local_num_[e], down_lora_grad_bf16, b, n_blocks);
+            }
             dump_bf16_matrix("bwd_step2_down_lora_grad", e, down_lora_grad_bf16, m_local_num_[e], config_.intermediate_size);
             dump_buffer_b<T>("lora_down_A_t_bb", e, lora_down_A_t_bb_[e],config_.intermediate_size, padded_lora_rank_);
-            dump_buffer_a<T>("lora_down_inter_ba_", e, lora_down_inter_ba_[e], m_local_num_[e], padded_lora_rank_); 
+            dump_buffer_a<T>("lora_down_inter_ba_", e, lora_down_inter_ba_[e], m_local_num_[e], padded_lora_rank_);
             free(down_lora_grad_bf16);
           }
         }
@@ -2643,20 +2692,31 @@ public:
       }
 
       // Convert Stage 1 output (BufferC) to BufferA for Stage 2
+      // NOTE: Must use temporary buffers because BufferA's internal storage is the same as
+      // the bak_fwd_ptr. In-place from_mat would corrupt data during tile layout transformation.
       backend->do_work_stealing_job(
           activated_expert, nullptr,
           [&](int task_id) {
             int expert_idx = m_expert_id_map_[task_id];
+            int num_tokens = m_local_num_[expert_idx];
+            if (num_tokens == 0) return;
+
+            // Allocate temporary buffers for linear data
+            ggml_bf16_t *temp_gate = (ggml_bf16_t *)aligned_alloc(64,
+                sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            ggml_bf16_t *temp_up = (ggml_bf16_t *)aligned_alloc(64,
+                sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+
             // Convert lora_gate_temp_grad_bc_ to lora_gate_inter_ba_
-            lora_gate_temp_grad_bc_[expert_idx]->to_mat(
-                m_local_num_[expert_idx], (ggml_bf16_t *)lora_gate_inter_ba_bak_fwd_ptr[expert_idx], 0, 1);
-            lora_gate_inter_ba_[expert_idx]->from_mat(
-                m_local_num_[expert_idx], (ggml_bf16_t *)lora_gate_inter_ba_bak_fwd_ptr[expert_idx], 0, 1);
+            lora_gate_temp_grad_bc_[expert_idx]->to_mat(num_tokens, temp_gate, 0, 1);
+            lora_gate_inter_ba_[expert_idx]->from_mat(num_tokens, temp_gate, 0, 1);
+
             // Convert lora_up_temp_grad_bc_ to lora_up_inter_ba_
-            lora_up_temp_grad_bc_[expert_idx]->to_mat(
-                m_local_num_[expert_idx], (ggml_bf16_t *)lora_up_inter_ba_bak_fwd_ptr[expert_idx], 0, 1);
-            lora_up_inter_ba_[expert_idx]->from_mat(
-                m_local_num_[expert_idx], (ggml_bf16_t *)lora_up_inter_ba_bak_fwd_ptr[expert_idx], 0, 1);
+            lora_up_temp_grad_bc_[expert_idx]->to_mat(num_tokens, temp_up, 0, 1);
+            lora_up_inter_ba_[expert_idx]->from_mat(num_tokens, temp_up, 0, 1);
+
+            free(temp_gate);
+            free(temp_up);
           },
           nullptr);
 
@@ -3130,7 +3190,7 @@ public:
             // lora_inter_down = intermediate @ down_lora_A.T
             // Use lora_down_inter_ba_inter_ with k=intermediate_size
             amx::mat_mul(num_tokens, padded_lora_rank_, config_.intermediate_size,
-                        lora_down_inter_ba_inter_[expert_idx], lora_down_A_t_bb_[expert_idx],
+                        lora_down_inter_ba_inter_[expert_idx], lora_down_A_bb_[expert_idx],
                         lora_down_lora_inter_bc_[expert_idx], ith, nth, use_amx);
           },
           nullptr);
