@@ -34,10 +34,21 @@
 
 #include "moe.hpp"
 
+
 #ifdef USE_NUMA
 #include <numa.h>
 #include <numaif.h>
 #endif
+
+// Bit-level NaN/Inf detection (works with -ffast-math)
+static inline bool is_nan_or_inf_bitwise(float f) {
+  uint32_t bits;
+  memcpy(&bits, &f, sizeof(float));
+  // NaN/Inf have all exponent bits set (0x7F800000)
+  // NaN also has non-zero mantissa
+  uint32_t exp_mask = 0x7F800000;
+  return (bits & exp_mask) == exp_mask;
+}
 
 // Reuse activation functions from sft_moe.hpp
 static inline __m512 sigmoid_route(__m512 x) {
@@ -109,7 +120,7 @@ static void dump_bf16_matrix(const char* name, int expert_id,
   std::vector<std::pair<int, int>> nan_positions;
   for (int i = 0; i < rows * cols; i++) {
     f32_data[i] = GGML_BF16_TO_FP32(data[i]);
-    if (std::isnan(f32_data[i]) || std::isinf(f32_data[i])) {
+    if (is_nan_or_inf_bitwise(f32_data[i])) {
       int row = i / cols;
       int col = i % cols;
       nan_positions.push_back({row, col});
@@ -639,7 +650,7 @@ public:
     down_lora_B_ = config_.down_lora_B;
 
     // Calculate padded lora_rank for AMX alignment (must be multiple of 32)
-    padded_lora_rank_ = (config_.lora_rank + 31) / 32 * 32;
+    padded_lora_rank_ = (config_.lora_rank + T::K_STEP - 1) / T::K_STEP * T::K_STEP;
 
 
     // Local buffers - forward pass
@@ -1227,7 +1238,6 @@ public:
         [&](int task_id) {
           int ith = task_id;
           up_bb_lora_B_[expert_idx]->from_mat(up_B_padded, ith, nth);
-          gate_bb_lora_A_[expert_idx]->from_mat(gate_A_padded, ith, nth);
           gate_bb_lora_B_[expert_idx]->from_mat(gate_B_padded, ith, nth);
         }, nullptr);
 
@@ -1237,6 +1247,7 @@ public:
         [&](int task_id) {
           int ith = task_id;
           up_bb_lora_A_[expert_idx]->from_mat(up_A_padded, ith, nth);
+          gate_bb_lora_A_[expert_idx]->from_mat(gate_A_padded, ith, nth);
           down_bb_lora_A_[expert_idx]->from_mat(down_A_padded, ith, nth);
         }, nullptr);
 
@@ -1436,6 +1447,8 @@ public:
 
         ggml_bf16_t *gate_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
         ggml_bf16_t *up_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+        memset(gate_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+        memset(up_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
 
         lora_gate_inter_bc_[expert_idx]->to_mat(num_tokens, gate_inter_bf16, 0, 1);
         lora_up_inter_bc_[expert_idx]->to_mat(num_tokens, up_inter_bf16, 0, 1);
@@ -1611,7 +1624,7 @@ public:
 
         // Allocate temporary bf16 buffer for conversion
         ggml_bf16_t *down_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
-
+        memset(down_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
         lora_down_inter_bc_[expert_idx]->to_mat(num_tokens, down_inter_bf16, 0, 1);
         lora_down_inter_ba_[expert_idx]->from_mat(num_tokens, down_inter_bf16, 0, 1);
                   
@@ -2045,6 +2058,18 @@ public:
         },
         nullptr);
 
+    for (int e = 0; e < config_.expert_num; e++) {
+      if (m_local_num_[e] > 0) {
+        dump_bf16_matrix("bwd_recompute_input", e, m_local_input_ptr_[e],
+                        m_local_num_[e], config_.hidden_size);
+        dump_bf16_matrix("bwd_recompute_down_output_grad", e,
+                        m_local_down_output_grad_ptr_[e], m_local_num_[e],
+                        config_.hidden_size);
+        dump_buffer_a<T>("gate_up_ba_AAA_", e, gate_up_ba_[e], m_local_num_[e], config_.hidden_size);
+      }
+    }
+
+    
     int nth = T::recommended_nth(config_.intermediate_size);
 
     // Step 1: Compute base gate/up projections
@@ -2318,6 +2343,11 @@ public:
                      lora_up_inter_bc_[expert_idx], ith, nth_lora, use_amx);
       }, nullptr);
 
+      for (int e = 0; e < config_.expert_num; e++) {
+        dump_buffer_b<T>("gate_bb_lora_A",e , gate_bb_lora_A_[e], padded_lora_rank_, config_.hidden_size);
+        dump_buffer_a<T>("gate_up_ba", e, gate_up_ba_[e], m_local_num_[e], config_.hidden_size);
+      }
+
 
       // Convert BufferC to BufferA for LoRA stage 2
       backend->do_work_stealing_job(activated_expert, nullptr, [&](int task_id) {
@@ -2327,6 +2357,8 @@ public:
 
         ggml_bf16_t *gate_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
         ggml_bf16_t *up_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+        memset(gate_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+        memset(up_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
 
         lora_gate_inter_bc_[expert_idx]->to_mat(num_tokens, gate_inter_bf16, 0, 1);
         lora_up_inter_bc_[expert_idx]->to_mat(num_tokens, up_inter_bf16, 0, 1);
@@ -2375,6 +2407,8 @@ public:
           if (m_local_num_[e] > 0) {
             ggml_bf16_t *gate_lora_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
             ggml_bf16_t *up_lora_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
+            memset(gate_lora_bf16, 0, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
+            memset(up_lora_bf16, 0, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
             // N_BLOCK=256, need to call to_mat for each block to export all columns
             int n_blocks = (config_.intermediate_size + T::N_BLOCK - 1) / T::N_BLOCK;
             for (int b = 0; b < n_blocks; b++) {
@@ -2402,6 +2436,8 @@ public:
         // Convert LoRA outputs to bf16 and add to base
         ggml_bf16_t *gate_lora_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
         ggml_bf16_t *up_lora_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
+        memset(gate_lora_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
+        memset(up_lora_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
 
         lora_gate_output_bc_[expert_idx]->to_mat(num_tokens, gate_lora_bf16, ith, nth);
         lora_up_output_bc_[expert_idx]->to_mat(num_tokens, up_lora_bf16, ith, nth);
@@ -2468,6 +2504,7 @@ public:
         if (num_tokens == 0) return;
 
         ggml_bf16_t *down_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+        memset(down_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
         lora_down_lora_inter_bc_[expert_idx]->to_mat(num_tokens, down_inter_bf16, 0, 1);
         lora_down_inter_ba_[expert_idx]->from_mat(num_tokens, down_inter_bf16, 0, 1);
         dump_bf16_matrix("bwd_step2_down_lora_inter", expert_idx, down_inter_bf16, num_tokens, padded_lora_rank_);
@@ -2500,6 +2537,7 @@ public:
         for (int e = 0; e < config_.expert_num; e++) {
           if (m_local_num_[e] > 0) {
             ggml_bf16_t *down_lora_grad_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
+            memset(down_lora_grad_bf16, 0, sizeof(ggml_bf16_t) * m_local_num_[e] * config_.intermediate_size);
             // N_BLOCK=256, need to call to_mat for each block to export all columns
             int n_blocks = (config_.intermediate_size + T::N_BLOCK - 1) / T::N_BLOCK;
             for (int b = 0; b < n_blocks; b++) {
@@ -2521,6 +2559,7 @@ public:
         if (num_tokens == 0) return;
 
         ggml_bf16_t *down_lora_grad_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
+        memset(down_lora_grad_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
         lora_down_temp_grad_inter_bc_[expert_idx]->to_mat(num_tokens, down_lora_grad_bf16, ith, nth);
 
         auto [n_start, n_end] = T::split_range_n(config_.intermediate_size, ith, nth);
@@ -2707,6 +2746,9 @@ public:
             ggml_bf16_t *temp_up = (ggml_bf16_t *)aligned_alloc(64,
                 sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
 
+            memset(temp_gate, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            memset(temp_up, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+
             // Convert lora_gate_temp_grad_bc_ to lora_gate_inter_ba_
             lora_gate_temp_grad_bc_[expert_idx]->to_mat(num_tokens, temp_gate, 0, 1);
             lora_gate_inter_ba_[expert_idx]->from_mat(num_tokens, temp_gate, 0, 1);
@@ -2860,7 +2902,7 @@ public:
             if (num_tokens == 0) return;
 
             ggml_bf16_t *intermediate = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
-
+            memset(intermediate, 0, sizeof(ggml_bf16_t) * num_tokens * config_.intermediate_size);
             for (int t = 0; t < num_tokens; t++) {
               ggml_bf16_t *gate_ptr = m_local_gate_output_ptr_[expert_idx] + t * config_.intermediate_size;
               ggml_bf16_t *up_ptr = m_local_up_output_ptr_[expert_idx] + t * config_.intermediate_size;
@@ -2907,6 +2949,7 @@ public:
 
             // For down_grad, need to apply routing weights first
             ggml_bf16_t *down_grad_weighted = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * config_.hidden_size);
+            memset(down_grad_weighted, 0, sizeof(ggml_bf16_t) * num_tokens * config_.hidden_size);
             for (int t = 0; t < num_tokens; t++) {
               int token_idx = m_local_token_indices_ptr_[expert_idx][t];
               int expert_pos = m_local_expert_positions_ptr_[expert_idx][t];
@@ -2965,6 +3008,7 @@ public:
             // Export BufferC to linear bf16 format using to_mat(), then convert to f32
             // BufferC is tile-blocked layout, cannot be accessed directly as row-major
             ggml_bf16_t *lora_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            memset(lora_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
             lora_gate_inter_bc_[expert_idx]->to_mat(num_tokens, lora_inter_bf16, 0, 1);
 
             // Convert to f32 for computation
@@ -3029,9 +3073,11 @@ public:
 
             // Export BufferC to linear bf16 format using to_mat(), then convert to f32
             ggml_bf16_t *temp_grad_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            memset(temp_grad_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
             lora_gate_temp_grad_bc_[expert_idx]->to_mat(num_tokens, temp_grad_bf16, 0, 1);
 
             float *temp_grad = (float *)aligned_alloc(64, sizeof(float) * num_tokens * padded_lora_rank_);
+            memset(temp_grad, 0, sizeof(float) * num_tokens * padded_lora_rank_);
             for (int t = 0; t < num_tokens; t++) {
               for (int r = 0; r < padded_lora_rank_; r++) {
                 temp_grad[t * padded_lora_rank_ + r] = ggml_bf16_to_fp32(temp_grad_bf16[t * padded_lora_rank_ + r]);
@@ -3089,9 +3135,11 @@ public:
 
             // Export BufferC to linear bf16 format using to_mat(), then convert to f32
             ggml_bf16_t *lora_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            memset(lora_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
             lora_up_inter_bc_[expert_idx]->to_mat(num_tokens, lora_inter_bf16, 0, 1);
 
             float *lora_inter = (float *)aligned_alloc(64, sizeof(float) * num_tokens * padded_lora_rank_);
+            memset(lora_inter, 0, sizeof(float) * num_tokens * padded_lora_rank_);
             for (int t = 0; t < num_tokens; t++) {
               for (int r = 0; r < padded_lora_rank_; r++) {
                 lora_inter[t * padded_lora_rank_ + r] = ggml_bf16_to_fp32(lora_inter_bf16[t * padded_lora_rank_ + r]);
@@ -3145,9 +3193,11 @@ public:
 
             // Export BufferC to linear bf16 format using to_mat(), then convert to f32
             ggml_bf16_t *temp_grad_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            memset(temp_grad_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
             lora_up_temp_grad_bc_[expert_idx]->to_mat(num_tokens, temp_grad_bf16, 0, 1);
 
             float *temp_grad = (float *)aligned_alloc(64, sizeof(float) * num_tokens * padded_lora_rank_);
+            memset(temp_grad, 0, sizeof(float) * num_tokens * padded_lora_rank_);
             for (int t = 0; t < num_tokens; t++) {
               for (int r = 0; r < padded_lora_rank_; r++) {
                 temp_grad[t * padded_lora_rank_ + r] = ggml_bf16_to_fp32(temp_grad_bf16[t * padded_lora_rank_ + r]);
@@ -3204,6 +3254,7 @@ public:
 
             // Export BufferC to linear bf16 format using to_mat(), then convert to f32
             ggml_bf16_t *lora_inter_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            memset(lora_inter_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
             lora_down_lora_inter_bc_[expert_idx]->to_mat(num_tokens, lora_inter_bf16, 0, 1);
 
             // DUMP: down_lora_inter (intermediate @ down_lora_A.T) - before freeing
@@ -3212,6 +3263,7 @@ public:
             }
 
             float *lora_inter = (float *)aligned_alloc(64, sizeof(float) * num_tokens * padded_lora_rank_);
+            memset(lora_inter, 0, sizeof(float) * num_tokens * padded_lora_rank_);
             for (int t = 0; t < num_tokens; t++) {
               for (int r = 0; r < padded_lora_rank_; r++) {
                 lora_inter[t * padded_lora_rank_ + r] = ggml_bf16_to_fp32(lora_inter_bf16[t * padded_lora_rank_ + r]);
@@ -3220,7 +3272,7 @@ public:
             free(lora_inter_bf16);
 
             ggml_bf16_t *down_grad_weighted = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * config_.hidden_size);
-
+            memset(down_grad_weighted, 0, sizeof(ggml_bf16_t) * num_tokens * config_.hidden_size);
             // Reconstruct weighted down_grad (we loaded weighted version to BufferA)
             // But we need it again for grad_B computation
             for (int t = 0; t < num_tokens; t++) {
@@ -3290,9 +3342,11 @@ public:
 
             // Export BufferC to linear bf16 format using to_mat(), then convert to f32
             ggml_bf16_t *temp_grad_bf16 = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
+            memset(temp_grad_bf16, 0, sizeof(ggml_bf16_t) * num_tokens * padded_lora_rank_);
             lora_down_temp_grad_bc_[expert_idx]->to_mat(num_tokens, temp_grad_bf16, 0, 1);
 
             float *temp_grad = (float *)aligned_alloc(64, sizeof(float) * num_tokens * padded_lora_rank_);
+            memset(temp_grad, 0, sizeof(float) * num_tokens * padded_lora_rank_);
             for (int t = 0; t < num_tokens; t++) {
               for (int r = 0; r < padded_lora_rank_; r++) {
                 temp_grad[t * padded_lora_rank_ + r] = ggml_bf16_to_fp32(temp_grad_bf16[t * padded_lora_rank_ + r]);
