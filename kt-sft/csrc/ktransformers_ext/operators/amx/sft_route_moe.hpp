@@ -1732,6 +1732,8 @@ public:
     bool use_amx = (qlen > 4 * config_.expert_num / config_.routed_expert_num);
     int activated_expert = 0;
 
+    this->update_lora(backend);
+
     std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
     std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
     std::vector<std::shared_ptr<typename T::BufferC>> up_bc_;
@@ -2146,10 +2148,14 @@ public:
                      up_lora_B_src + i * config_.lora_rank,
                      sizeof(ggml_bf16_t) * config_.lora_rank);
             }
-
-            lora_up_A_bb_[expert_idx]->from_mat(up_lora_A_padded, 0, 1);
-            lora_up_B_bb_[expert_idx]->from_mat(up_lora_B_padded, 0, 1);
-
+            nth = T::recommended_nth(padded_lora_rank_);
+            for (int ith = 0; ith < nth; ith++) {
+              lora_up_A_bb_[expert_idx]->from_mat(up_lora_A_padded, ith,nth);
+            }
+            nth = T::recommended_nth(config_.intermediate_size);
+            for (int ith = 0; ith < nth; ith++) {
+              lora_up_B_bb_[expert_idx]->from_mat(up_lora_B_padded, ith, nth);
+            }
             // Create and load transposed lora_B for grad_A computation
             // up_lora_B is [intermediate_size, padded_rank], need [padded_rank, intermediate_size]
             ggml_bf16_t *up_lora_B_t_padded = (ggml_bf16_t *)aligned_alloc(64, sizeof(ggml_bf16_t) * padded_lora_rank_ * config_.intermediate_size);
@@ -2160,7 +2166,10 @@ public:
                 up_lora_B_t_padded[r * config_.intermediate_size + i] = up_lora_B_src[i * config_.lora_rank + r];
               }
             }
-            lora_up_B_t_bb_[expert_idx]->from_mat(up_lora_B_t_padded, 0, 1);
+            nth = T::recommended_nth(padded_lora_rank_);
+            for (int ith = 0; ith < nth; ith++) {
+               lora_up_B_t_bb_[expert_idx]->from_mat(up_lora_B_t_padded, ith, nth);
+            }
             free(up_lora_B_t_padded);
 
             // Create and load transposed lora_A for input grad LoRA computation
@@ -2202,9 +2211,14 @@ public:
                      down_lora_B_src + h * config_.lora_rank,
                      sizeof(ggml_bf16_t) * config_.lora_rank);
             }
-
-            lora_down_A_bb_[expert_idx]->from_mat(down_lora_A_padded, 0, 1);
-            lora_down_B_bb_[expert_idx]->from_mat(down_lora_B_padded, 0, 1);
+            nth = T::recommended_nth(padded_lora_rank_);
+            for (int ith = 0; ith < nth; ith++) {
+               lora_down_A_bb_[expert_idx]->from_mat(down_lora_A_padded, ith, nth);
+            }
+            nth = T::recommended_nth(config_.hidden_size);
+            for (int ith = 0; ith < nth; ith++) {
+               lora_down_B_bb_[expert_idx]->from_mat(down_lora_B_padded, ith, nth);
+            }
 
           // Create and load transposed lora_A for grad_A computation
             // down_lora_A is [intermediate_size, padded_rank], need [padded_rank, intermediate_size]
@@ -2220,7 +2234,11 @@ public:
 
             dump_bf16_matrix("loraAt", expert_idx, down_lora_A_t_padded, config_.intermediate_size, padded_lora_rank_);
             dump_bf16_matrix("loraA", expert_idx, down_lora_A_padded, padded_lora_rank_, config_.intermediate_size);
-            lora_down_A_t_bb_[expert_idx]->from_mat(down_lora_A_t_padded, 0, 1);
+            nth = T::recommended_nth(config_.intermediate_size);
+            for (int ith = 0; ith < nth; ith++) {
+               lora_down_A_t_bb_[expert_idx]->from_mat(down_lora_A_t_padded, ith, nth);
+            }
+            // lora_down_A_t_bb_[expert_idx]->from_mat(down_lora_A_t_padded, 0, 1);
             free(down_lora_A_t_padded);
             // Create and load transposed lora_B for grad_A computation
             // down_lora_B is [hidden_size, padded_rank], need [padded_rank, hidden_size]
