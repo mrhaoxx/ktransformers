@@ -1451,12 +1451,12 @@ class KSFTRouteExpertsCPU(torch.autograd.Function):
 
             # Create buffer tensors (will be updated before each forward)
             # NOTE: No need for .cpu() since experts are already on CPU (moved above)
-            instance.gate_lora_A = torch.stack(gate_lora_A_list, dim=0).contiguous()
-            instance.gate_lora_B = torch.stack(gate_lora_B_list, dim=0).contiguous()
-            instance.up_lora_A = torch.stack(up_lora_A_list, dim=0).contiguous()
-            instance.up_lora_B = torch.stack(up_lora_B_list, dim=0).contiguous()
-            instance.down_lora_A = torch.stack(down_lora_A_list, dim=0).contiguous()
-            instance.down_lora_B = torch.stack(down_lora_B_list, dim=0).contiguous()
+            instance.gate_lora_A = torch.stack(gate_lora_A_list, dim=0).to(torch.bfloat16).contiguous()
+            instance.gate_lora_B = torch.stack(gate_lora_B_list, dim=0).to(torch.bfloat16).contiguous()
+            instance.up_lora_A = torch.stack(up_lora_A_list, dim=0).to(torch.bfloat16).contiguous()
+            instance.up_lora_B = torch.stack(up_lora_B_list, dim=0).to(torch.bfloat16).contiguous()
+            instance.down_lora_A = torch.stack(down_lora_A_list, dim=0).to(torch.bfloat16).contiguous()
+            instance.down_lora_B = torch.stack(down_lora_B_list, dim=0).to(torch.bfloat16).contiguous()
 
             # # TODO: Optional debug output - can be removed if not needed
             # print(f"[{instance.key}] LoRA weights stacked:")
