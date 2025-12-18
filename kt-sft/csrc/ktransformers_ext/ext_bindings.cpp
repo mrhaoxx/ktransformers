@@ -1007,7 +1007,7 @@ class SFT_ROUTE_MOEBindings {
                 args_->weights,
                 args_->input,
                 args_->output_grad,
-                args_->input_grad, 
+                args_->input_grad,
                 args_->grad_weights);
         }
 
@@ -1029,6 +1029,22 @@ class SFT_ROUTE_MOEBindings {
             return std::make_pair(
                 (intptr_t)&inner,
                 (intptr_t)args);
+        }
+    };
+
+    class UpdateLoraBindings {
+      public:
+        struct Args {
+            CPUInfer *cpuinfer;
+            SFT_ROUTE_MOE<T> *moe;
+        };
+        static void inner(void *args) {
+            Args *args_ = (Args *)args;
+            args_->cpuinfer->enqueue(&SFT_ROUTE_MOE<T>::update_lora, args_->moe);
+        }
+        static std::pair<intptr_t, intptr_t> cpuinfer_interface(SFT_ROUTE_MOE<T> &moe) {
+            Args *args = new Args{nullptr, &moe};
+            return std::make_pair((intptr_t)&inner, (intptr_t)args);
         }
     };
 };
@@ -1193,6 +1209,7 @@ PYBIND11_MODULE(cpuinfer_ext, m) {
         .def(py::init<SFT_ROUTE_MOEConfig>())
         .def("warm_up", &SFT_ROUTE_MOEBindings<amx::GemmKernel224BF>::WarmUpBindings::cpuinfer_interface)
         .def("load_weights", &SFT_ROUTE_MOEBindings<amx::GemmKernel224BF>::LoadWeightsBindings::cpuinfer_interface)
+        .def("update_lora", &SFT_ROUTE_MOEBindings<amx::GemmKernel224BF>::UpdateLoraBindings::cpuinfer_interface)
         .def("forward", &SFT_ROUTE_MOEBindings<amx::GemmKernel224BF>::ForwardBindings::cpuinfer_interface)
         .def("backward", &SFT_ROUTE_MOEBindings<amx::GemmKernel224BF>::BackwardBindings::cpuinfer_interface);
 
@@ -1200,6 +1217,7 @@ PYBIND11_MODULE(cpuinfer_ext, m) {
         .def(py::init<SFT_ROUTE_MOEConfig>())
         .def("warm_up", &SFT_ROUTE_MOEBindings<amx::GemmKernel224Int8>::WarmUpBindings::cpuinfer_interface)
         .def("load_weights", &SFT_ROUTE_MOEBindings<amx::GemmKernel224Int8>::LoadWeightsBindings::cpuinfer_interface)
+        .def("update_lora", &SFT_ROUTE_MOEBindings<amx::GemmKernel224Int8>::UpdateLoraBindings::cpuinfer_interface)
         .def("forward", &SFT_ROUTE_MOEBindings<amx::GemmKernel224Int8>::ForwardBindings::cpuinfer_interface)
         .def("backward", &SFT_ROUTE_MOEBindings<amx::GemmKernel224Int8>::BackwardBindings::cpuinfer_interface);
 

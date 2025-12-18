@@ -690,7 +690,9 @@ class KDeepseekV2Model(BaseInjectedModule):
                     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
                 )
             else:
-                causal_mask = None
+                causal_mask = self._update_causal_mask(
+                    attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+                )
 
         # embed positions
         hidden_states = inputs_embeds

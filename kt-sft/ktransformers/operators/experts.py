@@ -1593,6 +1593,9 @@ class KSFTRouteExpertsCPU(torch.autograd.Function):
                     instance_info['up_lora_B'][i].copy_(up_lora_B_list[i])
                     instance_info['down_lora_A'][i].copy_(down_lora_A_list[i])
                     instance_info['down_lora_B'][i].copy_(down_lora_B_list[i])
+                # Update LoRA weights in C++ AMX buffers
+                cpu_infer.submit(moe.update_lora())
+                cpu_infer.sync()
 
         # Same forward logic as KSFTExpertsCPU
         if input_tensor.size(0) == 1 and torch.cuda.is_current_stream_capturing():
@@ -1662,6 +1665,11 @@ class KSFTRouteExpertsCPU(torch.autograd.Function):
                 instance_info['grad_up_lora_B'].zero_()
                 instance_info['grad_down_lora_A'].zero_()
                 instance_info['grad_down_lora_B'].zero_()
+
+            # Update LoRA weights in C++ AMX buffers before backward
+            if 'lora_params_list' in instance_info:
+                ctx.cpu_infer.submit(ctx.moe.update_lora())
+                ctx.cpu_infer.sync()
 
         bw_start = time.time()
         ctx.cpu_infer.submit(
